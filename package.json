@@ -1,0 +1,35 @@
+{
+  "name": "@mgpl-diagnostics/auth-kit",
+  "version": "1.0.0",
+  "description": "MGPL Diagnostics authentication for the backend: scrypt passwords, revocable sessions (Redis or memory), rate-limited timing-safe login, password reset, roles and branch-aware permissions. An internal API, no HTTP server.",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": "github:mgpl-diagnostics/auth-kit",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./redis": { "types": "./dist/redis.d.ts", "import": "./dist/redis.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "README.md", "AGENTS.md", "llms.txt", "LICENSE"],
+  "publishConfig": { "registry": "https://npm.pkg.github.com" },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx scripts/test.ts",
+    "prepare": "tsup"
+  },
+  "peerDependencies": { "ioredis": ">=5" },
+  "peerDependenciesMeta": { "ioredis": { "optional": true } },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "ioredis": "^5.11.1",
+    "ioredis-mock": "^8.13.1",
+    "tsup": "^8.5.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "engines": { "node": ">=20" }
+}

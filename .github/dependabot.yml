@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # our own packages are released together and bumped by hand
+      - dependency-name: "@mgpl-diagnostics/*"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
