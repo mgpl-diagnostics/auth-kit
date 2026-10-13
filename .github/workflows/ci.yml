@@ -27,3 +27,5 @@ jobs:
       - name: Tests (data integrity, lookups, ranges, search quality and speed)
         run: npm test
       - run: npm run build
+      - name: llms-full.txt is up to date (run `npm run llms` and commit if this fails)
+        run: npm run llms && git diff --exit-code -- llms-full.txt
