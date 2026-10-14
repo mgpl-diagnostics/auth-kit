@@ -1,11 +1,12 @@
 # @mgpl-diagnostics/auth-kit
 
-> Internal authentication API for the MGPL Diagnostics backend (Node.js ≥ 20). Covers scrypt password hashing with rehash-on-login and a password policy; opaque session tokens stored as SHA-256, with a sliding idle timeout and an absolute max age (memory or Redis stores); timing-safe, rate-limited login with multi-organisation emails; password change and single-use reset tokens; role-based, branch-aware permissions. No HTTP server.
+> Internal authentication API for the MGPL Diagnostics backend (Node.js ≥ 20). Covers scrypt password hashing with rehash-on-login and a password policy; opaque session tokens stored as SHA-256 or (JWT mode) HS256 access tokens with rotating single-use refresh tokens, with a sliding idle timeout and an absolute max age (memory or Redis stores); timing-safe, rate-limited login with multi-organisation emails; password change and single-use reset tokens; role-based, branch-aware permissions. No HTTP server.
 
 Key facts for agents:
 - `const auth = createAuth({ users, orgs, roles, audit, sessions, kv, limiter })`. db-kit repositories satisfy users/orgs/roles/audit.
 - `auth.login({ email, password, orgCode?, ip })` → `{ token, expiresAt, user }`; `auth.context(token)` → `{ viewer, can, branchesFor, permissions }`.
 - Errors: `AuthError` with `code` (INVALID_CREDENTIALS, ACCOUNT_DISABLED, INVITE_PENDING, ORG_REQUIRED, RATE_LIMITED, WEAK_PASSWORD, INVALID_TOKEN, UNAUTHENTICATED, FORBIDDEN) and `statusCode`.
+- JWT mode: `createAuth({ …, kv, jwt: { secret, issuer?, accessTtlMs? } })`; login returns `token` (access JWT) + `refreshToken`; `auth.refresh({ refreshToken })` rotates; reuse of a spent refresh token ends the session; `verifyAccessToken` checks a JWT without storage.
 - Redis stores: `import { redisSessionStore, redisKeyValueStore, redisRateLimiter } from "@mgpl-diagnostics/auth-kit/redis"`.
 - Seed roles with `SYSTEM_ROLES`; permissions are "resource:action" with "*" wildcards.
 
@@ -18,5 +19,6 @@ Key facts for agents:
 
 - [src/auth.ts](src/auth.ts): createAuth
 - [src/rbac.ts](src/rbac.ts): permissions and roles
+- [src/jwt.ts](src/jwt.ts): HS256 JWT sign/verify
 - [src/password.ts](src/password.ts): hashing and policy
 - [src/redis.ts](src/redis.ts): Redis stores

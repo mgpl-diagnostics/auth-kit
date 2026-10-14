@@ -149,12 +149,81 @@ async function flows(label: string, stores: { sessions: SessionStore; kv: KeyVal
   ok(db.auditLog.some((e) => e.action === "auth.login") && db.auditLog.some((e) => e.action === "auth.login_failed") && db.auditLog.some((e) => e.action === "auth.password_reset"), "audit trail written");
 }
 
+// ------------------------------------------------------------------ JWT mode: access + refresh tokens
+
+const SECRET = "test-secret-0123456789-abcdefghijklmnop";
+const issued: string[] = []; // refresh tokens handed out, to prove Redis never stores them
+
+async function jwtFlows(label: string, stores: { sessions: SessionStore; kv: KeyValueStore; limiter: RateLimiter }) {
+  console.log(`\n[jwt / ${label}]`);
+  const db = fakeDb();
+  await db.add({ id: "j1", orgId: "org-a", name: "Asha", email: "asha@mgpl.in", password: "tulsi-leaf-raipur", status: "active", roles: [{ role: "front_desk", branchId: "b1" }] });
+  const auth = createAuth({ users: db.userStore, audit: db.audit, ...stores, session: { idleMs: 60_000, maxAgeMs: 120_000, touchEveryMs: 0 }, jwt: { secret: SECRET, issuer: "mgpl-api", accessTtlMs: 60_000, reuseGraceMs: 200 } });
+
+  const l = await auth.login({ email: "asha@mgpl.in", password: "tulsi-leaf-raipur" });
+  issued.push(l.refreshToken!);
+  const [h, p] = l.token.split(".");
+  const header = JSON.parse(Buffer.from(h!, "base64url").toString());
+  const claims = JSON.parse(Buffer.from(p!, "base64url").toString());
+  ok(header.alg === "HS256" && claims.sub === "j1" && claims.org === "org-a" && claims.iss === "mgpl-api" && claims.exp - claims.iat === 60, "login: HS256 access JWT (sub, org, sid, iss, 60 s)");
+  ok(!!l.refreshToken && l.refreshToken.length === 43 && l.refreshExpiresAt! > l.expiresAt, "login: opaque refresh token outlives the access token");
+  ok((await auth.authenticate(l.token))?.userId === "j1" && auth.verifyAccessToken(l.token)?.sid === claims.sid, "access token → viewer; verifyAccessToken without storage");
+  ok((await auth.authenticate(l.refreshToken)) === null, "a refresh token is not a bearer token");
+
+  // tampering
+  const forged = `${h}.${Buffer.from(JSON.stringify({ ...claims, sub: "someone-else" })).toString("base64url")}.${l.token.split(".")[2]}`;
+  const none = `${Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url")}.${p}.`;
+  const other = createAuth({ users: db.userStore, ...stores, jwt: { secret: "another-secret-0123456789-abcdefghijk" } });
+  ok((await auth.authenticate(forged)) === null && (await auth.authenticate(none)) === null && (await other.authenticate(l.token)) === null, "forged claims, alg none and a foreign secret are refused");
+  const rotated = createAuth({ users: db.userStore, ...stores, jwt: { secret: ["new-secret-0123456789-abcdefghijklmnopq", SECRET], issuer: "mgpl-api" } });
+  ok((await rotated.authenticate(l.token))?.userId === "j1", "secret rotation: old tokens verify while the old secret is listed");
+
+  // refresh rotation
+  const r1 = await auth.refresh({ refreshToken: l.refreshToken! });
+  issued.push(r1.refreshToken);
+  ok(r1.refreshToken !== l.refreshToken && (await auth.authenticate(r1.accessToken))?.userId === "j1" && auth.verifyAccessToken(r1.accessToken)?.sid === claims.sid, "refresh: new access + new refresh token, same session");
+  ok((await code(auth.refresh({ refreshToken: l.refreshToken! }))) === "INVALID_TOKEN" && (await auth.authenticate(r1.accessToken)) !== null, "spent refresh token within the grace window: refused, session kept");
+  await sleep(250);
+  ok((await code(auth.refresh({ refreshToken: l.refreshToken! }))) === "INVALID_TOKEN" && (await auth.authenticate(r1.accessToken)) === null, "spent refresh token reused later: session ended (theft)");
+  ok((await code(auth.refresh({ refreshToken: r1.refreshToken }))) === "INVALID_TOKEN" && db.auditLog.some((e) => e.action === "auth.refresh_reuse"), "…its newer refresh token dies too, and it is audited");
+
+  // logout / revocation apply at once despite a valid signature
+  const a = await auth.login({ email: "asha@mgpl.in", password: "tulsi-leaf-raipur" });
+  const b = await auth.login({ email: "asha@mgpl.in", password: "tulsi-leaf-raipur" });
+  issued.push(a.refreshToken!, b.refreshToken!);
+  await auth.logout(a.token);
+  ok((await auth.authenticate(a.token)) === null && (await code(auth.refresh({ refreshToken: a.refreshToken! }))) === "INVALID_TOKEN" && (await auth.authenticate(b.token)) !== null, "logout with the access token ends that session and its refresh token");
+  await auth.logout(b.refreshToken!);
+  ok((await auth.authenticate(b.token)) === null, "logout with the refresh token works too");
+  const c = await auth.login({ email: "asha@mgpl.in", password: "tulsi-leaf-raipur" });
+  const d = await auth.login({ email: "asha@mgpl.in", password: "tulsi-leaf-raipur" });
+  issued.push(c.refreshToken!, d.refreshToken!);
+  await auth.changePassword({ userId: "j1", currentPassword: "tulsi-leaf-raipur", newPassword: "banyan-roots-7", currentToken: c.token });
+  ok((await auth.authenticate(c.token)) !== null && (await auth.authenticate(d.token)) === null, "change password with an access token keeps this session only");
+  db.users.set("j1", { ...db.users.get("j1")!, status: "disabled" });
+  ok((await code(auth.refresh({ refreshToken: c.refreshToken! }))) === "INVALID_TOKEN" && (await auth.authenticate(c.token)) === null, "disabled user: refresh refused, access token dead at once");
+
+  const expiring = createAuth({ users: db.userStore, ...stores, jwt: { secret: SECRET, accessTtlMs: 1000 } });
+  db.users.set("j1", { ...db.users.get("j1")!, status: "active" });
+  const e = await expiring.login({ email: "asha@mgpl.in", password: "banyan-roots-7" });
+  issued.push(e.refreshToken!);
+  await sleep(1100);
+  ok((await expiring.authenticate(e.token)) === null && (await expiring.authenticate((await expiring.refresh({ refreshToken: e.refreshToken! })).accessToken)) !== null, "expired access token refused; refresh brings a working one");
+  let threw = false;
+  try { createAuth({ users: db.userStore, sessions: stores.sessions, jwt: { secret: "short" } }); } catch { threw = true; }
+  ok(threw, "JWT mode refuses short secrets and a missing kv");
+}
+
 async function main() {
   const t0 = Date.now();
   await units();
   await flows("memory", { sessions: memorySessionStore(), kv: memoryKeyValueStore(), limiter: memoryRateLimiter({ limit: 100, windowMs: 60_000 }) });
   const redis = new RedisMock() as any;
   await flows("redis", { sessions: redisSessionStore(redis), kv: redisKeyValueStore(redis), limiter: redisRateLimiter(redis, { limit: 100, windowMs: 60_000 }) });
+  await jwtFlows("memory", { sessions: memorySessionStore(), kv: memoryKeyValueStore(), limiter: memoryRateLimiter({ limit: 100, windowMs: 60_000 }) });
+  await jwtFlows("redis", { sessions: redisSessionStore(redis), kv: redisKeyValueStore(redis), limiter: redisRateLimiter(redis, { limit: 100, windowMs: 60_000 }) });
+  const dump = (await Promise.all(((await redis.keys("*")) as string[]).map(async (k) => `${k} ${(await redis.type(k)) === "string" ? await redis.get(k) : ""}`))).join("\n");
+  ok(issued.length > 5 && issued.every((t) => !dump.includes(t)), "redis never holds a raw refresh token");
   const keys: string[] = await redis.keys("*");
   ok(keys.length > 0 && !keys.some((k) => /[A-Za-z0-9_-]{43}$/.test(k) && !k.includes("sess:") && !k.includes("kv:")), "redis holds token hashes only");
   redis.disconnect();
