@@ -1,4 +1,5 @@
 import { AuthError } from "./errors";
+import { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./jwt";
 import { memoryRateLimiter } from "./memory";
 import { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, verifyPassword, type PasswordPolicy } from "./password";
 import { branchesFor, can, permissionsOf, roleMap, type Permission, type RoleAssignment, type RoleMap } from "./rbac";
@@ -29,6 +30,20 @@ export interface AuthOptions {
   /** How long an organisation's role list is cached. Default 30 s. */
   roleCacheMs?: number;
   passwordPolicy?: PasswordPolicy;
+  /**
+   * JWT mode: login and refresh return a short-lived access token (HS256 JWT, sent as Bearer) and a
+   * long-lived, single-use refresh token (opaque, rotated on every refresh). Needs `kv`. Without it,
+   * login returns one opaque session token as before.
+   */
+  jwt?: JwtOptions & {
+    /** Access-token lifetime. Default 15 minutes. */
+    accessTtlMs?: number;
+    /**
+     * A refresh token used twice is a theft signal and ends its session. Within this window the second
+     * use only fails (two tabs refreshing at once). Default 15 s.
+     */
+    reuseGraceMs?: number;
+  };
 }
 
 /** The signed-in user for one request. */
@@ -61,9 +76,25 @@ export interface LoginInput {
 }
 
 export interface LoginResult {
-  /** Give this to the client (Authorization: Bearer … or an httpOnly cookie). It is never stored. */
+  /**
+   * Give this to the client (Authorization: Bearer … or an httpOnly cookie). It is never stored.
+   * In JWT mode it is the access token and `expiresAt` its expiry.
+   */
   token: string;
   expiresAt: Date;
+  user: PublicUser;
+  /** JWT mode only: single-use, rotated by `refresh`. Only its hash is stored. */
+  refreshToken?: string;
+  /** JWT mode only: the refresh token dies here unless used before (idle window, session max age). */
+  refreshExpiresAt?: Date;
+}
+
+/** What `refresh` returns: a new access token and the next refresh token (the old one is spent). */
+export interface TokenPair {
+  accessToken: string;
+  accessExpiresAt: Date;
+  refreshToken: string;
+  refreshExpiresAt: Date;
   user: PublicUser;
 }
 
@@ -90,6 +121,10 @@ export function createAuth(o: AuthOptions) {
   const limiter = o.limiter ?? memoryRateLimiter({ limit: 10, windowMs: 15 * 60_000 });
   const roleCache = new Map<string, { map: RoleMap; at: number }>();
   let dummy: Promise<string> | undefined;
+  const jwt = o.jwt ? jwtSigner(o.jwt) : null;
+  const accessTtlMs = o.jwt?.accessTtlMs ?? 15 * 60_000;
+  const reuseGraceMs = o.jwt?.reuseGraceMs ?? 15_000;
+  if (jwt && !o.kv) throw new Error("createAuth: JWT mode needs `kv` (refresh tokens)");
 
   const audit = async (entry: Parameters<AuditSink["log"]>[0]) => {
     try {
@@ -118,9 +153,27 @@ export function createAuth(o: AuthOptions) {
   async function startSession(user: AuthUser, ip?: string, userAgent?: string): Promise<{ token: string; session: Session }> {
     const token = randomToken();
     const now = Date.now();
-    const session: Session = { id: hashToken(token), userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent };
+    // JWT mode: the session id is random and never handed out; the refresh token points at it through kv
+    const id = jwt ? hashToken(randomToken()) : hashToken(token);
+    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent };
     await o.sessions.create(session, idleMs);
+    if (jwt) await o.kv!.set(`refresh:${hashToken(token)}`, id, maxAgeMs);
     return { token, session };
+  }
+
+  /** A signed access token for a session (JWT mode). */
+  function accessToken(s: Session): { token: string; expiresAt: Date } {
+    const now = Date.now();
+    const exp = Math.min(now + accessTtlMs, s.expiresAt);
+    return { token: jwt!.sign({ sub: s.userId, org: s.orgId, sid: s.id, iat: Math.floor(now / 1000), exp: Math.floor(exp / 1000) }), expiresAt: new Date(Math.floor(exp / 1000) * 1000) };
+  }
+
+  const refreshExpiry = (s: Session, now = Date.now()) => new Date(Math.min(s.expiresAt, now + idleMs));
+
+  /** The session a token belongs to: an access JWT's `sid` (expired ones too), else the opaque token's hash. */
+  function sessionIdOf(token: string): string | null {
+    if (jwt && looksLikeJwt(token)) return jwt.verify(token, { ignoreExpiry: true })?.sid ?? null;
+    return hashToken(token);
   }
 
   async function rolesFor(orgId: string): Promise<RoleMap> {
@@ -132,8 +185,18 @@ export function createAuth(o: AuthOptions) {
   }
 
   async function authenticate(token: string | null | undefined): Promise<Viewer | null> {
-    if (!token || token.length < 20 || token.length > 200) return null;
-    const s = await o.sessions.get(hashToken(token));
+    if (!token || token.length < 20) return null;
+    let s: Session | null;
+    if (jwt && looksLikeJwt(token)) {
+      const claims = jwt.verify(token);
+      if (!claims) return null;
+      // the session is still checked, so logout, revocation and "log out everywhere" apply at once
+      s = await o.sessions.get(claims.sid);
+      if (!s || s.userId !== claims.sub) return null;
+    } else {
+      if (token.length > 200) return null;
+      s = await o.sessions.get(hashToken(token));
+    }
     if (!s) return null;
     // the user is read on every request, so disabling an account or changing roles applies immediately
     const user = await o.users.get(s.userId);
@@ -182,7 +245,58 @@ export function createAuth(o: AuthOptions) {
       await o.users.update(user.id, patch);
       const { token, session } = await startSession(user, input.ip, input.userAgent);
       await audit({ orgId: user.orgId, userId: user.id, action: "auth.login", ip: input.ip });
-      return { token, expiresAt: new Date(session.expiresAt), user: publicUser({ ...user, lastLoginAt: patch.lastLoginAt }) };
+      const pub = publicUser({ ...user, lastLoginAt: patch.lastLoginAt });
+      if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
+      const access = accessToken(session);
+      return { token: access.token, expiresAt: access.expiresAt, refreshToken: token, refreshExpiresAt: refreshExpiry(session), user: pub };
+    },
+
+    /**
+     * JWT mode: spends a refresh token and returns a new access token and the next refresh token.
+     * Fails with INVALID_TOKEN when the token is unknown, spent, expired, or its session or user is
+     * gone. A spent token presented again after `reuseGraceMs` ends the whole session (it was copied).
+     */
+    async refresh(input: { refreshToken: string; ip?: string }): Promise<TokenPair> {
+      if (!jwt) throw new Error("createAuth: refresh needs the `jwt` option");
+      const invalid = () => new AuthError("INVALID_TOKEN", "Sign in again");
+      const rt = input.refreshToken ?? "";
+      if (rt.length < 20 || rt.length > 200) throw invalid();
+      const h = hashToken(rt);
+      const now = Date.now();
+      const sid = await o.kv!.take(`refresh:${h}`);
+      if (!sid) {
+        const used = await o.kv!.take(`refresh-used:${h}`);
+        if (used) {
+          const [usedSid, at] = used.split("|");
+          if (now - Number(at) <= reuseGraceMs) {
+            await o.kv!.set(`refresh-used:${h}`, used, maxAgeMs); // keep the marker for later reuse
+          } else if (usedSid) {
+            const s = await o.sessions.get(usedSid);
+            await o.sessions.delete(usedSid);
+            if (s) await audit({ orgId: s.orgId, userId: s.userId, action: "auth.refresh_reuse", ip: input.ip });
+          }
+        }
+        throw invalid();
+      }
+      const s = await o.sessions.get(sid);
+      if (!s) throw invalid();
+      const user = await o.users.get(s.userId);
+      if (!user || user.status !== "active" || user.orgId !== s.orgId) {
+        await o.sessions.deleteByUser(s.userId);
+        throw invalid();
+      }
+      await o.sessions.touch(s.id, now, idleMs);
+      const next = randomToken();
+      const ttl = Math.max(1, s.expiresAt - now);
+      await o.kv!.set(`refresh:${hashToken(next)}`, s.id, ttl);
+      await o.kv!.set(`refresh-used:${h}`, `${s.id}|${now}`, ttl);
+      const access = accessToken(s);
+      return { accessToken: access.token, accessExpiresAt: access.expiresAt, refreshToken: next, refreshExpiresAt: refreshExpiry(s, now), user: publicUser(user) };
+    },
+
+    /** JWT mode: the claims of a valid access token, without touching storage (for workers or other services). */
+    verifyAccessToken(token: string): AccessClaims | null {
+      return jwt && looksLikeJwt(token) ? jwt.verify(token) : null;
     },
 
     /** Token → viewer, or null (unknown, expired, logged out, disabled). Extends the idle window. */
@@ -209,8 +323,14 @@ export function createAuth(o: AuthOptions) {
       return ctx.viewer;
     },
 
+    /** Ends the session of an access token (even expired), a refresh token, or an opaque session token. */
     async logout(token: string): Promise<void> {
-      const s = await o.sessions.get(hashToken(token));
+      const id = sessionIdOf(token);
+      let s = id ? await o.sessions.get(id) : null;
+      if (!s && jwt && !looksLikeJwt(token)) {
+        const sid = await o.kv!.take(`refresh:${hashToken(token)}`);
+        s = sid ? await o.sessions.get(sid) : null;
+      }
       if (!s) return;
       await o.sessions.delete(s.id);
       await audit({ orgId: s.orgId, userId: s.userId, action: "auth.logout" });
@@ -218,7 +338,7 @@ export function createAuth(o: AuthOptions) {
 
     /** Logs a user out everywhere (optionally keeping the current session). */
     async logoutAll(userId: string, keepToken?: string): Promise<number> {
-      return o.sessions.deleteByUser(userId, keepToken ? hashToken(keepToken) : undefined);
+      return o.sessions.deleteByUser(userId, (keepToken && sessionIdOf(keepToken)) || undefined);
     },
 
     /** Active sessions ("devices") of a user. `id` can be passed to revokeSession. */
@@ -238,7 +358,7 @@ export function createAuth(o: AuthOptions) {
       const user = await o.users.get(input.userId);
       if (!user || !(await verifyPassword(input.currentPassword, user.passwordHash))) throw new AuthError("INVALID_CREDENTIALS", "Current password is incorrect");
       if (input.currentPassword === input.newPassword) throw new AuthError("WEAK_PASSWORD", "Choose a different password");
-      await setNewPassword(user, input.newPassword, input.currentToken ? hashToken(input.currentToken) : undefined);
+      await setNewPassword(user, input.newPassword, (input.currentToken && sessionIdOf(input.currentToken)) || undefined);
       await audit({ orgId: user.orgId, userId: user.id, action: "auth.password_change" });
     },
 

@@ -3,7 +3,7 @@
 **Authentication and permissions for the MGPL Diagnostics backend, as an internal API.**
 There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jobs) calls these functions.
 
-![tests](https://img.shields.io/badge/checks-65-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
+![tests](https://img.shields.io/badge/checks-98-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
 
 ## What it does
 
@@ -12,6 +12,7 @@ There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jo
 | **Passwords** | scrypt (N=2¹⁵), salted, self-describing hashes; weaker hashes upgraded on the next login; NIST-style policy (length, common passwords, repeated characters, no email) |
 | **Login** | rate-limited per IP and per email; timing-safe (an unknown email costs the same as a wrong password); same email in several organisations → `ORG_REQUIRED`; audited |
 | **Sessions** | opaque tokens, stored only as SHA-256; idle timeout that slides with use plus an absolute maximum age; list devices, revoke one, log out everywhere |
+| **JWT mode** | short-lived HS256 access tokens plus single-use refresh tokens, rotated on every refresh; a refresh token used twice ends its session (theft); secret rotation; logout and revocation still apply at once |
 | **Accounts** | disabling a user or changing roles applies on the very next request |
 | **Passwords, again** | change (keeps this device, ends the others); reset (single-use, expiring token; ends every session); admin set |
 | **Permissions** | `resource:action` with wildcards; roles per branch or organisation-wide; built-in lab roles plus each organisation's own |
@@ -46,11 +47,60 @@ When you create an organisation, seed the roles: `seedOrganization(repos, { …,
 (db-kit). To create a user, call `auth.hashNewPassword(password, { email })`, which checks the policy
 and then hashes.
 
+## JWT mode (access + refresh tokens)
+
+Pass `jwt` and login returns a short-lived **access token** (an HS256 JWT, sent as `Authorization: Bearer`)
+and a long-lived **refresh token** (opaque, single-use). The client trades the refresh token for a new pair
+when the access token expires.
+
+```ts
+const auth = createAuth({ …, kv: redisKeyValueStore(redis), jwt: { secret: process.env.JWT_SECRET!, issuer: "mgpl-api", accessTtlMs: 15 * 60_000 } });
+
+const { token: accessToken, refreshToken } = await auth.login({ email, password });
+const ctx = await auth.context(accessToken);                    // same context as before
+const next = await auth.refresh({ refreshToken });              // { accessToken, refreshToken (new), … }
+```
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as auth-kit
+  participant S as Session store
+  participant K as kv (Redis)
+  C->>A: login(email, password)
+  A->>S: session { id: random }
+  A->>K: refresh:hash(R1) → session id
+  A-->>C: access JWT (sub, org, sid, exp 15 min) + R1
+  C->>A: context(JWT) — every request
+  A->>A: verify HS256, exp
+  A->>S: session still there? re-read the user
+  C->>A: refresh(R1)
+  A->>K: take refresh:hash(R1) (single use)
+  A->>K: refresh:hash(R2) → sid · refresh-used:hash(R1)
+  A-->>C: new JWT + R2
+  C->>A: refresh(R1) again (stolen copy)
+  A->>S: delete the session → JWT and R2 die
+```
+
+- **Revocation stays instant.** The JWT carries the session id, and every request checks that the session
+  still exists and re-reads the user (rule 3). The signature alone is enough only for
+  `verifyAccessToken(token)`, which workers and other services can use without storage.
+- **Refresh tokens rotate.** Each is single-use and stored only as a hash. A spent token presented again
+  within `reuseGraceMs` (default 15 s, two tabs refreshing at once) is just refused; later, it ends the
+  session.
+- **Lifetimes.** Access: `accessTtlMs` (default 15 min). Refresh: the session's idle window, slid by each
+  refresh, and never past the absolute maximum age.
+- **Secrets.** At least 32 characters. Pass `secret: [newSecret, oldSecret]` to rotate: the first signs and
+  all verify.
+- `logout` accepts the access token (even expired), the refresh token, or an opaque session token.
+
 ## API
 
 | Call | Returns / throws |
 | --- | --- |
-| `login({ email, password, orgCode?, ip?, userAgent? })` | `{ token, expiresAt, user }` · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `login({ email, password, orgCode?, ip?, userAgent? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `refresh({ refreshToken, ip? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` |
+| `verifyAccessToken(token)` | JWT mode: claims `{ sub, org, sid, iat, exp }` or null, no storage read |
 | `authenticate(token)` | `Viewer \| null` (slides the idle window) |
 | `context(token)` | `{ viewer, can, branchesFor, permissions }` (anonymous when the token is missing or invalid) |
 | `require(token, permission?, branchId?)` | `Viewer` · `UNAUTHENTICATED` `FORBIDDEN` |
@@ -65,6 +115,7 @@ and then hashes.
 Also exported:
 - `hashPassword`, `verifyPassword`, `needsRehash`, `assertPasswordPolicy`;
 - `randomToken`, `hashToken`;
+- `jwtSigner`, `looksLikeJwt` (HS256 sign/verify on node:crypto);
 - `PERMISSIONS`, `SYSTEM_ROLES`;
 - `can`, `branchesFor`, `permissionsOf`, `roleMap`.
 
