@@ -7,6 +7,7 @@ Key facts for agents:
 - `auth.login({ email, password, orgCode?, ip })` → `{ token, expiresAt, user }`; `auth.context(token)` → `{ viewer, can, branchesFor, permissions }`.
 - Errors: `AuthError` with `code` (INVALID_CREDENTIALS, ACCOUNT_DISABLED, INVITE_PENDING, ORG_REQUIRED, RATE_LIMITED, WEAK_PASSWORD, INVALID_TOKEN, UNAUTHENTICATED, FORBIDDEN) and `statusCode`.
 - JWT mode: `createAuth({ …, kv, jwt: { secret, issuer?, accessTtlMs? } })`; login returns `token` (access JWT) + `refreshToken`; `auth.refresh({ refreshToken })` rotates; reuse of a spent refresh token ends the session; `verifyAccessToken` checks a JWT without storage.
+- Device binding: login/refresh take `device: { deviceId, fingerprint, clientSessionId, info }`; a refresh from another deviceId → INVALID_TOKEN and the session ends (`deviceBinding: "enforce" | "flag" | "off"`); a fingerprint change is audited.
 - Redis stores: `import { redisSessionStore, redisKeyValueStore, redisRateLimiter } from "@mgpl-diagnostics/auth-kit/redis"`.
 - Seed roles with `SYSTEM_ROLES`; permissions are "resource:action" with "*" wildcards.
 

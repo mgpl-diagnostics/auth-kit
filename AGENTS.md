@@ -13,7 +13,7 @@ src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, 
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
 src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  98 checks; session and JWT flows run on both memory and Redis (ioredis-mock) stores
+scripts/test.ts  110 checks; session, JWT and device-binding flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules
@@ -27,6 +27,8 @@ scripts/test.ts  98 checks; session and JWT flows run on both memory and Redis (
 6. **JWT mode keeps rules 1 and 3.** Access JWTs carry the session id and every request still checks the
    session and re-reads the user; refresh tokens are opaque, single-use and stored as hashes. Never accept
    `alg` from the token (HS256 only), never sign with a secret under 32 characters.
+   Device signals from clients are untrusted: always pass them through `cleanDeviceSignals`; a refresh
+   from another `deviceId` ends the session unless `deviceBinding` says otherwise.
 7. Error codes are a public contract (`AuthError.code`). Add new ones; never rename existing ones.
 
 ## Commands

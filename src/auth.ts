@@ -3,7 +3,7 @@ import { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./j
 import { memoryRateLimiter } from "./memory";
 import { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, verifyPassword, type PasswordPolicy } from "./password";
 import { branchesFor, can, permissionsOf, roleMap, type Permission, type RoleAssignment, type RoleMap } from "./rbac";
-import type { AuditSink, AuthUser, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
+import type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
 
 export interface AuthOptions {
   users: UserStore;
@@ -44,6 +44,12 @@ export interface AuthOptions {
      */
     reuseGraceMs?: number;
   };
+  /**
+   * What a refresh from another device does. The device is the `deviceId` the client sent at login.
+   * "enforce" (default): refused with INVALID_TOKEN and the session ends (audit auth.device_mismatch).
+   * "flag": allowed, audited. "off": not compared. A changed fingerprint is only audited (auth.fingerprint_changed).
+   */
+  deviceBinding?: "enforce" | "flag" | "off";
 }
 
 /** The signed-in user for one request. */
@@ -73,6 +79,8 @@ export interface LoginInput {
   orgCode?: string;
   ip?: string;
   userAgent?: string;
+  /** Security signals from the client (device id, fingerprint, …), stored on the session. */
+  device?: DeviceSignals;
 }
 
 export interface LoginResult {
@@ -101,6 +109,27 @@ export interface TokenPair {
 const publicUser = ({ passwordHash: _p, ...u }: AuthUser): PublicUser => u;
 const normalizeEmail = (e: string) => e.trim().toLowerCase();
 
+const ID_RE = /^[A-Za-z0-9_.:+\/=-]{8,128}$/;
+/** Keeps only well-formed, size-capped device signals (clients are untrusted). */
+export function cleanDeviceSignals(d: DeviceSignals | null | undefined): DeviceSignals | undefined {
+  if (!d || typeof d !== "object") return undefined;
+  const out: DeviceSignals = {};
+  for (const k of ["deviceId", "fingerprint", "clientSessionId"] as const) {
+    const v = d[k];
+    if (typeof v === "string" && ID_RE.test(v)) out[k] = v;
+  }
+  if (d.info && typeof d.info === "object" && !Array.isArray(d.info)) {
+    const info: Record<string, string | number | boolean> = {};
+    for (const [k, v] of Object.entries(d.info).slice(0, 20)) {
+      if (!/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(k)) continue;
+      if (typeof v === "string") info[k] = v.slice(0, 200);
+      else if ((typeof v === "number" && Number.isFinite(v)) || typeof v === "boolean") info[k] = v;
+    }
+    if (Object.keys(info).length) out.info = info;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export type Auth = ReturnType<typeof createAuth>;
 
 /**
@@ -125,6 +154,7 @@ export function createAuth(o: AuthOptions) {
   const accessTtlMs = o.jwt?.accessTtlMs ?? 15 * 60_000;
   const reuseGraceMs = o.jwt?.reuseGraceMs ?? 15_000;
   if (jwt && !o.kv) throw new Error("createAuth: JWT mode needs `kv` (refresh tokens)");
+  const deviceBinding = o.deviceBinding ?? "enforce";
 
   const audit = async (entry: Parameters<AuditSink["log"]>[0]) => {
     try {
@@ -150,12 +180,12 @@ export function createAuth(o: AuthOptions) {
     return user ? [user] : [];
   }
 
-  async function startSession(user: AuthUser, ip?: string, userAgent?: string): Promise<{ token: string; session: Session }> {
+  async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals): Promise<{ token: string; session: Session }> {
     const token = randomToken();
     const now = Date.now();
     // JWT mode: the session id is random and never handed out; the refresh token points at it through kv
     const id = jwt ? hashToken(randomToken()) : hashToken(token);
-    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent };
+    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent, device: cleanDeviceSignals(device) };
     await o.sessions.create(session, idleMs);
     if (jwt) await o.kv!.set(`refresh:${hashToken(token)}`, id, maxAgeMs);
     return { token, session };
@@ -243,7 +273,7 @@ export function createAuth(o: AuthOptions) {
       const patch: { lastLoginAt: Date; passwordHash?: string } = { lastLoginAt: new Date() };
       if (needsRehash(user.passwordHash)) patch.passwordHash = await hashPassword(input.password);
       await o.users.update(user.id, patch);
-      const { token, session } = await startSession(user, input.ip, input.userAgent);
+      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device);
       await audit({ orgId: user.orgId, userId: user.id, action: "auth.login", ip: input.ip });
       const pub = publicUser({ ...user, lastLoginAt: patch.lastLoginAt });
       if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
@@ -256,7 +286,7 @@ export function createAuth(o: AuthOptions) {
      * Fails with INVALID_TOKEN when the token is unknown, spent, expired, or its session or user is
      * gone. A spent token presented again after `reuseGraceMs` ends the whole session (it was copied).
      */
-    async refresh(input: { refreshToken: string; ip?: string }): Promise<TokenPair> {
+    async refresh(input: { refreshToken: string; ip?: string; userAgent?: string; device?: DeviceSignals }): Promise<TokenPair> {
       if (!jwt) throw new Error("createAuth: refresh needs the `jwt` option");
       const invalid = () => new AuthError("INVALID_TOKEN", "Sign in again");
       const rt = input.refreshToken ?? "";
@@ -285,13 +315,33 @@ export function createAuth(o: AuthOptions) {
         await o.sessions.deleteByUser(s.userId);
         throw invalid();
       }
-      await o.sessions.touch(s.id, now, idleMs);
+      // device binding: the refresh token only works on the device that signed in
+      const device = cleanDeviceSignals(input.device);
+      const bound = s.device?.deviceId;
+      let session = s;
+      if (deviceBinding !== "off" && bound && device?.deviceId !== bound) {
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null } });
+        if (deviceBinding === "enforce") {
+          await o.sessions.delete(s.id);
+          throw invalid();
+        }
+      }
+      if (device?.fingerprint && s.device?.fingerprint && device.fingerprint !== s.device.fingerprint) {
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.fingerprint_changed", ip: input.ip, entity: "session", data: { from: s.device.fingerprint, to: device.fingerprint } });
+      }
+      if (device && (device.fingerprint !== s.device?.fingerprint || device.clientSessionId !== s.device?.clientSessionId || input.ip !== s.ip)) {
+        // keep the device id from login; record the latest fingerprint, tab, info and address
+        session = { ...s, lastSeenAt: now, ip: input.ip ?? s.ip, userAgent: input.userAgent ?? s.userAgent, device: { ...s.device, ...device, deviceId: bound ?? device.deviceId } };
+        await o.sessions.create(session, idleMs);
+      } else {
+        await o.sessions.touch(s.id, now, idleMs);
+      }
       const next = randomToken();
       const ttl = Math.max(1, s.expiresAt - now);
       await o.kv!.set(`refresh:${hashToken(next)}`, s.id, ttl);
       await o.kv!.set(`refresh-used:${h}`, `${s.id}|${now}`, ttl);
-      const access = accessToken(s);
-      return { accessToken: access.token, accessExpiresAt: access.expiresAt, refreshToken: next, refreshExpiresAt: refreshExpiry(s, now), user: publicUser(user) };
+      const access = accessToken(session);
+      return { accessToken: access.token, accessExpiresAt: access.expiresAt, refreshToken: next, refreshExpiresAt: refreshExpiry(session, now), user: publicUser(user) };
     },
 
     /** JWT mode: the claims of a valid access token, without touching storage (for workers or other services). */
