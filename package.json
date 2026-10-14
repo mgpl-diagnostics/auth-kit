@@ -1,6 +1,6 @@
 {
   "name": "@mgpl-diagnostics/auth-kit",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MGPL Diagnostics authentication for the backend: scrypt passwords, revocable sessions (Redis or memory), rate-limited timing-safe login, password reset, roles and branch-aware permissions. An internal API, no HTTP server.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",

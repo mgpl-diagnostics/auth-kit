@@ -30,7 +30,7 @@
 **Authentication and permissions for the MGPL Diagnostics backend, as an internal API.**
 There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jobs) calls these functions.
 
-![tests](https://img.shields.io/badge/checks-98-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
+![tests](https://img.shields.io/badge/checks-110-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
 
 ## What it does
 
@@ -121,12 +121,27 @@ sequenceDiagram
   all verify.
 - `logout` accepts the access token (even expired), the refresh token, or an opaque session token.
 
+### Device binding
+
+Clients can send security signals with `login` and `refresh` (`device: DeviceSignals`). They are cleaned
+(`cleanDeviceSignals`: ids 8–128 safe characters, at most 20 short `info` values) and stored on the session.
+
+| Signal | What it is | On refresh |
+| --- | --- | --- |
+| `deviceId` | random id the client keeps per browser profile or app install | must match the login's, else (`deviceBinding: "enforce"`, default) `INVALID_TOKEN` and the session ends; `"flag"` only audits; `"off"` ignores |
+| `fingerprint` | client-side hash of stable device attributes | a change is audited (`auth.fingerprint_changed`); browsers update, so it never blocks |
+| `clientSessionId` | random id per tab or app run | recorded (latest) |
+| `info` | platform, language, timezone, screen… | recorded (latest) |
+
+A session that signed in without a `deviceId` is bound by the first refresh that sends one.
+`sessionsOf` returns `device`, so a "your devices" page can show it.
+
 ## API
 
 | Call | Returns / throws |
 | --- | --- |
-| `login({ email, password, orgCode?, ip?, userAgent? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
-| `refresh({ refreshToken, ip? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` |
+| `login({ email, password, orgCode?, ip?, userAgent?, device? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `refresh({ refreshToken, ip?, userAgent?, device? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
 | `verifyAccessToken(token)` | JWT mode: claims `{ sub, org, sid, iat, exp }` or null, no storage read |
 | `authenticate(token)` | `Viewer \| null` (slides the idle window) |
 | `context(token)` | `{ viewer, can, branchesFor, permissions }` (anonymous when the token is missing or invalid) |
@@ -143,6 +158,7 @@ Also exported:
 - `hashPassword`, `verifyPassword`, `needsRehash`, `assertPasswordPolicy`;
 - `randomToken`, `hashToken`;
 - `jwtSigner`, `looksLikeJwt` (HS256 sign/verify on node:crypto);
+- `cleanDeviceSignals` and the `DeviceSignals` type;
 - `PERMISSIONS`, `SYSTEM_ROLES`;
 - `can`, `branchesFor`, `permissionsOf`, `roleMap`.
 
@@ -184,7 +200,7 @@ src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, 
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
 src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  98 checks; session and JWT flows run on both memory and Redis (ioredis-mock) stores
+scripts/test.ts  110 checks; session, JWT and device-binding flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules
@@ -198,6 +214,8 @@ scripts/test.ts  98 checks; session and JWT flows run on both memory and Redis (
 6. **JWT mode keeps rules 1 and 3.** Access JWTs carry the session id and every request still checks the
    session and re-reads the user; refresh tokens are opaque, single-use and stored as hashes. Never accept
    `alg` from the token (HS256 only), never sign with a secret under 32 characters.
+   Device signals from clients are untrusted: always pass them through `cleanDeviceSignals`; a refresh
+   from another `deviceId` ends the session unless `deviceBinding` says otherwise.
 7. Error codes are a public contract (`AuthError.code`). Add new ones; never rename existing ones.
 
 ## Commands
@@ -224,6 +242,7 @@ Key facts for agents:
 - `auth.login({ email, password, orgCode?, ip })` → `{ token, expiresAt, user }`; `auth.context(token)` → `{ viewer, can, branchesFor, permissions }`.
 - Errors: `AuthError` with `code` (INVALID_CREDENTIALS, ACCOUNT_DISABLED, INVITE_PENDING, ORG_REQUIRED, RATE_LIMITED, WEAK_PASSWORD, INVALID_TOKEN, UNAUTHENTICATED, FORBIDDEN) and `statusCode`.
 - JWT mode: `createAuth({ …, kv, jwt: { secret, issuer?, accessTtlMs? } })`; login returns `token` (access JWT) + `refreshToken`; `auth.refresh({ refreshToken })` rotates; reuse of a spent refresh token ends the session; `verifyAccessToken` checks a JWT without storage.
+- Device binding: login/refresh take `device: { deviceId, fingerprint, clientSessionId, info }`; a refresh from another deviceId → INVALID_TOKEN and the session ends (`deviceBinding: "enforce" | "flag" | "off"`); a fingerprint change is audited.
 - Redis stores: `import { redisSessionStore, redisKeyValueStore, redisRateLimiter } from "@mgpl-diagnostics/auth-kit/redis"`.
 - Seed roles with `SYSTEM_ROLES`; permissions are "resource:action" with "*" wildcards.
 
@@ -248,7 +267,7 @@ Key facts for agents:
 ```json
 {
   "name": "@mgpl-diagnostics/auth-kit",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MGPL Diagnostics authentication for the backend: scrypt passwords, revocable sessions (Redis or memory), rate-limited timing-safe login, password reset, roles and branch-aware permissions. An internal API, no HTTP server.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -377,7 +396,7 @@ console.log(`llms-full.txt: ${ordered.length} files, ${(out.length / 1024).toFix
 // npm test — passwords, login, sessions (memory + Redis stores), permissions, reset flow.
 import RedisMock from "ioredis-mock";
 import {
-  AuthError, createAuth, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
+  AuthError, cleanDeviceSignals, createAuth, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
   permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, SYSTEM_ROLES,
   type AuditSink, type AuthUser, type KeyValueStore, type RateLimiter, type RoleStore, type SessionStore, type UserStore,
 } from "../src/index";
@@ -585,6 +604,27 @@ async function jwtFlows(label: string, stores: { sessions: SessionStore; kv: Key
   issued.push(e.refreshToken!);
   await sleep(1100);
   ok((await expiring.authenticate(e.token)) === null && (await expiring.authenticate((await expiring.refresh({ refreshToken: e.refreshToken! })).accessToken)) !== null, "expired access token refused; refresh brings a working one");
+  // device binding: the refresh token works only on the device that signed in
+  const phone = { deviceId: "dev-phone-0001-abcdef", fingerprint: "fp-aaaaaaaaaaaa", clientSessionId: "tab-0001-xyz", info: { platform: "Android", screen: "412x915", "bad key": "x", note: "y".repeat(500) } };
+  const f = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone as any });
+  issued.push(f.refreshToken!);
+  const stored = (await auth.sessionsOf("j1")).find((x) => x.id === auth.verifyAccessToken(f.token)?.sid);
+  ok(stored?.device?.deviceId === phone.deviceId && stored.device.info?.platform === "Android" && !("bad key" in (stored.device.info ?? {})) && String(stored.device.info?.note).length === 200, "login stores the device signals on the session (cleaned, capped)");
+  const f2 = await auth.refresh({ refreshToken: f.refreshToken!, device: { ...phone, fingerprint: "fp-bbbbbbbbbbbb" } });
+  issued.push(f2.refreshToken);
+  ok(!!f2.accessToken && db.auditLog.some((x) => x.action === "auth.fingerprint_changed"), "same device, new fingerprint: refresh works, change audited");
+  ok((await code(auth.refresh({ refreshToken: f2.refreshToken, device: { deviceId: "dev-laptop-9999-zzzzzz" } }))) === "INVALID_TOKEN" && (await auth.authenticate(f2.accessToken)) === null && db.auditLog.some((x) => x.action === "auth.device_mismatch"), "refresh from another device: refused, session ended, audited");
+  const g = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone });
+  issued.push(g.refreshToken!);
+  ok((await code(auth.refresh({ refreshToken: g.refreshToken! }))) === "INVALID_TOKEN", "refresh without the device id of a bound session: refused");
+  const flagging = createAuth({ users: db.userStore, audit: db.audit, ...stores, deviceBinding: "flag", jwt: { secret: SECRET } });
+  const h2 = await flagging.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone });
+  issued.push(h2.refreshToken!);
+  const h3 = await flagging.refresh({ refreshToken: h2.refreshToken!, device: { deviceId: "dev-laptop-9999-zzzzzz" } });
+  issued.push(h3.refreshToken);
+  ok(!!h3.accessToken, 'deviceBinding "flag": a refresh from another device works (and is audited)');
+  ok(cleanDeviceSignals({ deviceId: "short", fingerprint: "<script>alert(1)</script>xx" }) === undefined, "malformed device ids are dropped");
+
   let threw = false;
   try { createAuth({ users: db.userStore, sessions: stores.sessions, jwt: { secret: "short" } }); } catch { threw = true; }
   ok(threw, "JWT mode refuses short secrets and a missing kv");
@@ -621,7 +661,7 @@ import { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./j
 import { memoryRateLimiter } from "./memory";
 import { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, verifyPassword, type PasswordPolicy } from "./password";
 import { branchesFor, can, permissionsOf, roleMap, type Permission, type RoleAssignment, type RoleMap } from "./rbac";
-import type { AuditSink, AuthUser, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
+import type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
 
 export interface AuthOptions {
   users: UserStore;
@@ -662,6 +702,12 @@ export interface AuthOptions {
      */
     reuseGraceMs?: number;
   };
+  /**
+   * What a refresh from another device does. The device is the `deviceId` the client sent at login.
+   * "enforce" (default): refused with INVALID_TOKEN and the session ends (audit auth.device_mismatch).
+   * "flag": allowed, audited. "off": not compared. A changed fingerprint is only audited (auth.fingerprint_changed).
+   */
+  deviceBinding?: "enforce" | "flag" | "off";
 }
 
 /** The signed-in user for one request. */
@@ -691,6 +737,8 @@ export interface LoginInput {
   orgCode?: string;
   ip?: string;
   userAgent?: string;
+  /** Security signals from the client (device id, fingerprint, …), stored on the session. */
+  device?: DeviceSignals;
 }
 
 export interface LoginResult {
@@ -719,6 +767,27 @@ export interface TokenPair {
 const publicUser = ({ passwordHash: _p, ...u }: AuthUser): PublicUser => u;
 const normalizeEmail = (e: string) => e.trim().toLowerCase();
 
+const ID_RE = /^[A-Za-z0-9_.:+\/=-]{8,128}$/;
+/** Keeps only well-formed, size-capped device signals (clients are untrusted). */
+export function cleanDeviceSignals(d: DeviceSignals | null | undefined): DeviceSignals | undefined {
+  if (!d || typeof d !== "object") return undefined;
+  const out: DeviceSignals = {};
+  for (const k of ["deviceId", "fingerprint", "clientSessionId"] as const) {
+    const v = d[k];
+    if (typeof v === "string" && ID_RE.test(v)) out[k] = v;
+  }
+  if (d.info && typeof d.info === "object" && !Array.isArray(d.info)) {
+    const info: Record<string, string | number | boolean> = {};
+    for (const [k, v] of Object.entries(d.info).slice(0, 20)) {
+      if (!/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(k)) continue;
+      if (typeof v === "string") info[k] = v.slice(0, 200);
+      else if ((typeof v === "number" && Number.isFinite(v)) || typeof v === "boolean") info[k] = v;
+    }
+    if (Object.keys(info).length) out.info = info;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export type Auth = ReturnType<typeof createAuth>;
 
 /**
@@ -743,6 +812,7 @@ export function createAuth(o: AuthOptions) {
   const accessTtlMs = o.jwt?.accessTtlMs ?? 15 * 60_000;
   const reuseGraceMs = o.jwt?.reuseGraceMs ?? 15_000;
   if (jwt && !o.kv) throw new Error("createAuth: JWT mode needs `kv` (refresh tokens)");
+  const deviceBinding = o.deviceBinding ?? "enforce";
 
   const audit = async (entry: Parameters<AuditSink["log"]>[0]) => {
     try {
@@ -768,12 +838,12 @@ export function createAuth(o: AuthOptions) {
     return user ? [user] : [];
   }
 
-  async function startSession(user: AuthUser, ip?: string, userAgent?: string): Promise<{ token: string; session: Session }> {
+  async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals): Promise<{ token: string; session: Session }> {
     const token = randomToken();
     const now = Date.now();
     // JWT mode: the session id is random and never handed out; the refresh token points at it through kv
     const id = jwt ? hashToken(randomToken()) : hashToken(token);
-    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent };
+    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent, device: cleanDeviceSignals(device) };
     await o.sessions.create(session, idleMs);
     if (jwt) await o.kv!.set(`refresh:${hashToken(token)}`, id, maxAgeMs);
     return { token, session };
@@ -861,7 +931,7 @@ export function createAuth(o: AuthOptions) {
       const patch: { lastLoginAt: Date; passwordHash?: string } = { lastLoginAt: new Date() };
       if (needsRehash(user.passwordHash)) patch.passwordHash = await hashPassword(input.password);
       await o.users.update(user.id, patch);
-      const { token, session } = await startSession(user, input.ip, input.userAgent);
+      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device);
       await audit({ orgId: user.orgId, userId: user.id, action: "auth.login", ip: input.ip });
       const pub = publicUser({ ...user, lastLoginAt: patch.lastLoginAt });
       if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
@@ -874,7 +944,7 @@ export function createAuth(o: AuthOptions) {
      * Fails with INVALID_TOKEN when the token is unknown, spent, expired, or its session or user is
      * gone. A spent token presented again after `reuseGraceMs` ends the whole session (it was copied).
      */
-    async refresh(input: { refreshToken: string; ip?: string }): Promise<TokenPair> {
+    async refresh(input: { refreshToken: string; ip?: string; userAgent?: string; device?: DeviceSignals }): Promise<TokenPair> {
       if (!jwt) throw new Error("createAuth: refresh needs the `jwt` option");
       const invalid = () => new AuthError("INVALID_TOKEN", "Sign in again");
       const rt = input.refreshToken ?? "";
@@ -903,13 +973,33 @@ export function createAuth(o: AuthOptions) {
         await o.sessions.deleteByUser(s.userId);
         throw invalid();
       }
-      await o.sessions.touch(s.id, now, idleMs);
+      // device binding: the refresh token only works on the device that signed in
+      const device = cleanDeviceSignals(input.device);
+      const bound = s.device?.deviceId;
+      let session = s;
+      if (deviceBinding !== "off" && bound && device?.deviceId !== bound) {
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null } });
+        if (deviceBinding === "enforce") {
+          await o.sessions.delete(s.id);
+          throw invalid();
+        }
+      }
+      if (device?.fingerprint && s.device?.fingerprint && device.fingerprint !== s.device.fingerprint) {
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.fingerprint_changed", ip: input.ip, entity: "session", data: { from: s.device.fingerprint, to: device.fingerprint } });
+      }
+      if (device && (device.fingerprint !== s.device?.fingerprint || device.clientSessionId !== s.device?.clientSessionId || input.ip !== s.ip)) {
+        // keep the device id from login; record the latest fingerprint, tab, info and address
+        session = { ...s, lastSeenAt: now, ip: input.ip ?? s.ip, userAgent: input.userAgent ?? s.userAgent, device: { ...s.device, ...device, deviceId: bound ?? device.deviceId } };
+        await o.sessions.create(session, idleMs);
+      } else {
+        await o.sessions.touch(s.id, now, idleMs);
+      }
       const next = randomToken();
       const ttl = Math.max(1, s.expiresAt - now);
       await o.kv!.set(`refresh:${hashToken(next)}`, s.id, ttl);
       await o.kv!.set(`refresh-used:${h}`, `${s.id}|${now}`, ttl);
-      const access = accessToken(s);
-      return { accessToken: access.token, accessExpiresAt: access.expiresAt, refreshToken: next, refreshExpiresAt: refreshExpiry(s, now), user: publicUser(user) };
+      const access = accessToken(session);
+      return { accessToken: access.token, accessExpiresAt: access.expiresAt, refreshToken: next, refreshExpiresAt: refreshExpiry(session, now), user: publicUser(user) };
     },
 
     /** JWT mode: the claims of a valid access token, without touching storage (for workers or other services). */
@@ -1081,7 +1171,7 @@ export class AuthError extends Error {
 ## File: src/index.ts
 
 ```ts
-export { createAuth, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type TokenPair, type Viewer } from "./auth";
+export { cleanDeviceSignals, createAuth, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type TokenPair, type Viewer } from "./auth";
 export { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./jwt";
 export { AuthError, type AuthErrorCode } from "./errors";
 export { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, SCRYPT, verifyPassword, type PasswordPolicy } from "./password";
@@ -1090,7 +1180,7 @@ export {
   type Permission, type RoleAssignment, type RoleDefinition, type RoleMap,
 } from "./rbac";
 export { memoryKeyValueStore, memoryRateLimiter, memorySessionStore } from "./memory";
-export type { AuditSink, AuthUser, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStatus, UserStore } from "./stores";
+export type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStatus, UserStore } from "./stores";
 ```
 
 
@@ -1626,6 +1716,23 @@ export interface Session {
   expiresAt: number;
   ip?: string;
   userAgent?: string;
+  /** What the client said about its device at login (and the latest fingerprint). See DeviceSignals. */
+  device?: DeviceSignals;
+}
+
+/**
+ * Security signals a client sends with login and refresh. All optional, all chosen by the client SDK;
+ * they are stored on the session (cleaned, size-capped) and compared on refresh.
+ */
+export interface DeviceSignals {
+  /** A random id the client created once and keeps (per browser profile or app install). Not derived from the device. */
+  deviceId?: string;
+  /** A hash of stable device attributes, computed on the client. It changes with browser updates, so a change is only logged. */
+  fingerprint?: string;
+  /** A random id per tab or app run. */
+  clientSessionId?: string;
+  /** Descriptive values (platform, language, timezone, screen, …): at most 20 keys, short values. */
+  info?: Record<string, string | number | boolean>;
 }
 
 export interface SessionStore {

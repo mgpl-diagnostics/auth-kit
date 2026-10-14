@@ -1,7 +1,7 @@
 // npm test — passwords, login, sessions (memory + Redis stores), permissions, reset flow.
 import RedisMock from "ioredis-mock";
 import {
-  AuthError, createAuth, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
+  AuthError, cleanDeviceSignals, createAuth, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
   permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, SYSTEM_ROLES,
   type AuditSink, type AuthUser, type KeyValueStore, type RateLimiter, type RoleStore, type SessionStore, type UserStore,
 } from "../src/index";
@@ -209,6 +209,27 @@ async function jwtFlows(label: string, stores: { sessions: SessionStore; kv: Key
   issued.push(e.refreshToken!);
   await sleep(1100);
   ok((await expiring.authenticate(e.token)) === null && (await expiring.authenticate((await expiring.refresh({ refreshToken: e.refreshToken! })).accessToken)) !== null, "expired access token refused; refresh brings a working one");
+  // device binding: the refresh token works only on the device that signed in
+  const phone = { deviceId: "dev-phone-0001-abcdef", fingerprint: "fp-aaaaaaaaaaaa", clientSessionId: "tab-0001-xyz", info: { platform: "Android", screen: "412x915", "bad key": "x", note: "y".repeat(500) } };
+  const f = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone as any });
+  issued.push(f.refreshToken!);
+  const stored = (await auth.sessionsOf("j1")).find((x) => x.id === auth.verifyAccessToken(f.token)?.sid);
+  ok(stored?.device?.deviceId === phone.deviceId && stored.device.info?.platform === "Android" && !("bad key" in (stored.device.info ?? {})) && String(stored.device.info?.note).length === 200, "login stores the device signals on the session (cleaned, capped)");
+  const f2 = await auth.refresh({ refreshToken: f.refreshToken!, device: { ...phone, fingerprint: "fp-bbbbbbbbbbbb" } });
+  issued.push(f2.refreshToken);
+  ok(!!f2.accessToken && db.auditLog.some((x) => x.action === "auth.fingerprint_changed"), "same device, new fingerprint: refresh works, change audited");
+  ok((await code(auth.refresh({ refreshToken: f2.refreshToken, device: { deviceId: "dev-laptop-9999-zzzzzz" } }))) === "INVALID_TOKEN" && (await auth.authenticate(f2.accessToken)) === null && db.auditLog.some((x) => x.action === "auth.device_mismatch"), "refresh from another device: refused, session ended, audited");
+  const g = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone });
+  issued.push(g.refreshToken!);
+  ok((await code(auth.refresh({ refreshToken: g.refreshToken! }))) === "INVALID_TOKEN", "refresh without the device id of a bound session: refused");
+  const flagging = createAuth({ users: db.userStore, audit: db.audit, ...stores, deviceBinding: "flag", jwt: { secret: SECRET } });
+  const h2 = await flagging.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone });
+  issued.push(h2.refreshToken!);
+  const h3 = await flagging.refresh({ refreshToken: h2.refreshToken!, device: { deviceId: "dev-laptop-9999-zzzzzz" } });
+  issued.push(h3.refreshToken);
+  ok(!!h3.accessToken, 'deviceBinding "flag": a refresh from another device works (and is audited)');
+  ok(cleanDeviceSignals({ deviceId: "short", fingerprint: "<script>alert(1)</script>xx" }) === undefined, "malformed device ids are dropped");
+
   let threw = false;
   try { createAuth({ users: db.userStore, sessions: stores.sessions, jwt: { secret: "short" } }); } catch { threw = true; }
   ok(threw, "JWT mode refuses short secrets and a missing kv");

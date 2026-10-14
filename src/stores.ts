@@ -53,6 +53,23 @@ export interface Session {
   expiresAt: number;
   ip?: string;
   userAgent?: string;
+  /** What the client said about its device at login (and the latest fingerprint). See DeviceSignals. */
+  device?: DeviceSignals;
+}
+
+/**
+ * Security signals a client sends with login and refresh. All optional, all chosen by the client SDK;
+ * they are stored on the session (cleaned, size-capped) and compared on refresh.
+ */
+export interface DeviceSignals {
+  /** A random id the client created once and keeps (per browser profile or app install). Not derived from the device. */
+  deviceId?: string;
+  /** A hash of stable device attributes, computed on the client. It changes with browser updates, so a change is only logged. */
+  fingerprint?: string;
+  /** A random id per tab or app run. */
+  clientSessionId?: string;
+  /** Descriptive values (platform, language, timezone, screen, …): at most 20 keys, short values. */
+  info?: Record<string, string | number | boolean>;
 }
 
 export interface SessionStore {

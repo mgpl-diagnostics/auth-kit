@@ -3,7 +3,7 @@
 **Authentication and permissions for the MGPL Diagnostics backend, as an internal API.**
 There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jobs) calls these functions.
 
-![tests](https://img.shields.io/badge/checks-98-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
+![tests](https://img.shields.io/badge/checks-110-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
 
 ## What it does
 
@@ -94,12 +94,27 @@ sequenceDiagram
   all verify.
 - `logout` accepts the access token (even expired), the refresh token, or an opaque session token.
 
+### Device binding
+
+Clients can send security signals with `login` and `refresh` (`device: DeviceSignals`). They are cleaned
+(`cleanDeviceSignals`: ids 8–128 safe characters, at most 20 short `info` values) and stored on the session.
+
+| Signal | What it is | On refresh |
+| --- | --- | --- |
+| `deviceId` | random id the client keeps per browser profile or app install | must match the login's, else (`deviceBinding: "enforce"`, default) `INVALID_TOKEN` and the session ends; `"flag"` only audits; `"off"` ignores |
+| `fingerprint` | client-side hash of stable device attributes | a change is audited (`auth.fingerprint_changed`); browsers update, so it never blocks |
+| `clientSessionId` | random id per tab or app run | recorded (latest) |
+| `info` | platform, language, timezone, screen… | recorded (latest) |
+
+A session that signed in without a `deviceId` is bound by the first refresh that sends one.
+`sessionsOf` returns `device`, so a "your devices" page can show it.
+
 ## API
 
 | Call | Returns / throws |
 | --- | --- |
-| `login({ email, password, orgCode?, ip?, userAgent? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
-| `refresh({ refreshToken, ip? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` |
+| `login({ email, password, orgCode?, ip?, userAgent?, device? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `refresh({ refreshToken, ip?, userAgent?, device? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
 | `verifyAccessToken(token)` | JWT mode: claims `{ sub, org, sid, iat, exp }` or null, no storage read |
 | `authenticate(token)` | `Viewer \| null` (slides the idle window) |
 | `context(token)` | `{ viewer, can, branchesFor, permissions }` (anonymous when the token is missing or invalid) |
@@ -116,6 +131,7 @@ Also exported:
 - `hashPassword`, `verifyPassword`, `needsRehash`, `assertPasswordPolicy`;
 - `randomToken`, `hashToken`;
 - `jwtSigner`, `looksLikeJwt` (HS256 sign/verify on node:crypto);
+- `cleanDeviceSignals` and the `DeviceSignals` type;
 - `PERMISSIONS`, `SYSTEM_ROLES`;
 - `can`, `branchesFor`, `permissionsOf`, `roleMap`.
 
