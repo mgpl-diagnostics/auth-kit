@@ -30,7 +30,7 @@
 **Authentication and permissions for the MGPL Diagnostics backend, as an internal API.**
 There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jobs) calls these functions.
 
-![tests](https://img.shields.io/badge/checks-110-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
+![tests](https://img.shields.io/badge/checks-126-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
 
 ## What it does
 
@@ -136,12 +136,20 @@ Clients can send security signals with `login` and `refresh` (`device: DeviceSig
 A session that signed in without a `deviceId` is bound by the first refresh that sends one.
 `sessionsOf` returns `device`, so a "your devices" page can show it.
 
+**TLS fingerprint.** The server can also pass `tlsFingerprint` (JA4 or JA3) to `login` and `refresh`. It
+is computed by whatever terminates TLS, so it never comes from the client: read it with security-kit's
+`readTlsFingerprint` (a header set by a trusted proxy). Only its SHA-256 (`hashTlsFingerprint`) is stored,
+as `Session.tlsFingerprintHash`. On refresh a different one is audited (`auth.tls_fingerprint_changed`,
+with both hashes) and the latest is kept; it never blocks, because browser updates and TLS-inspecting
+networks change it. A refresh without one keeps the stored hash, and `auth.device_mismatch` records
+`tls: "same" | "changed" | null`, which helps tell a copied token from a cleared browser.
+
 ## API
 
 | Call | Returns / throws |
 | --- | --- |
-| `login({ email, password, orgCode?, ip?, userAgent?, device? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
-| `refresh({ refreshToken, ip?, userAgent?, device? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
+| `login({ email, password, orgCode?, ip?, userAgent?, device?, tlsFingerprint? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `refresh({ refreshToken, ip?, userAgent?, device?, tlsFingerprint? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
 | `verifyAccessToken(token)` | JWT mode: claims `{ sub, org, sid, iat, exp }` or null, no storage read |
 | `authenticate(token)` | `Viewer \| null` (slides the idle window) |
 | `context(token)` | `{ viewer, can, branchesFor, permissions }` (anonymous when the token is missing or invalid) |
@@ -158,7 +166,7 @@ Also exported:
 - `hashPassword`, `verifyPassword`, `needsRehash`, `assertPasswordPolicy`;
 - `randomToken`, `hashToken`;
 - `jwtSigner`, `looksLikeJwt` (HS256 sign/verify on node:crypto);
-- `cleanDeviceSignals` and the `DeviceSignals` type;
+- `cleanDeviceSignals` and the `DeviceSignals` type; `hashTlsFingerprint`;
 - `PERMISSIONS`, `SYSTEM_ROLES`;
 - `can`, `branchesFor`, `permissionsOf`, `roleMap`.
 
@@ -200,7 +208,7 @@ src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, 
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
 src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  110 checks; session, JWT and device-binding flows run on both memory and Redis (ioredis-mock) stores
+scripts/test.ts  126 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules
@@ -215,7 +223,9 @@ scripts/test.ts  110 checks; session, JWT and device-binding flows run on both m
    session and re-reads the user; refresh tokens are opaque, single-use and stored as hashes. Never accept
    `alg` from the token (HS256 only), never sign with a secret under 32 characters.
    Device signals from clients are untrusted: always pass them through `cleanDeviceSignals`; a refresh
-   from another `deviceId` ends the session unless `deviceBinding` says otherwise.
+   from another `deviceId` ends the session unless `deviceBinding` says otherwise. The TLS fingerprint
+   (`tlsFingerprint`) comes from the server (security-kit's `readTlsFingerprint`, trusted proxy only),
+   never from client input; only `hashTlsFingerprint` of it is stored, and a change is audited, never blocking.
 7. Error codes are a public contract (`AuthError.code`). Add new ones; never rename existing ones.
 
 ## Commands
@@ -242,7 +252,7 @@ Key facts for agents:
 - `auth.login({ email, password, orgCode?, ip })` → `{ token, expiresAt, user }`; `auth.context(token)` → `{ viewer, can, branchesFor, permissions }`.
 - Errors: `AuthError` with `code` (INVALID_CREDENTIALS, ACCOUNT_DISABLED, INVITE_PENDING, ORG_REQUIRED, RATE_LIMITED, WEAK_PASSWORD, INVALID_TOKEN, UNAUTHENTICATED, FORBIDDEN) and `statusCode`.
 - JWT mode: `createAuth({ …, kv, jwt: { secret, issuer?, accessTtlMs? } })`; login returns `token` (access JWT) + `refreshToken`; `auth.refresh({ refreshToken })` rotates; reuse of a spent refresh token ends the session; `verifyAccessToken` checks a JWT without storage.
-- Device binding: login/refresh take `device: { deviceId, fingerprint, clientSessionId, info }`; a refresh from another deviceId → INVALID_TOKEN and the session ends (`deviceBinding: "enforce" | "flag" | "off"`); a fingerprint change is audited.
+- Device binding: login/refresh take `device: { deviceId, fingerprint, clientSessionId, info }`; a refresh from another deviceId → INVALID_TOKEN and the session ends (`deviceBinding: "enforce" | "flag" | "off"`); a fingerprint change is audited. `tlsFingerprint` (JA4/JA3 from the server's trusted TLS proxy, never the client) is stored only as `Session.tlsFingerprintHash`; a change is audited as auth.tls_fingerprint_changed, never blocking.
 - Redis stores: `import { redisSessionStore, redisKeyValueStore, redisRateLimiter } from "@mgpl-diagnostics/auth-kit/redis"`.
 - Seed roles with `SYSTEM_ROLES`; permissions are "resource:action" with "*" wildcards.
 
@@ -267,7 +277,7 @@ Key facts for agents:
 ```json
 {
   "name": "@mgpl-diagnostics/auth-kit",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "MGPL Diagnostics authentication for the backend: scrypt passwords, revocable sessions (Redis or memory), rate-limited timing-safe login, password reset, roles and branch-aware permissions. An internal API, no HTTP server.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -396,7 +406,7 @@ console.log(`llms-full.txt: ${ordered.length} files, ${(out.length / 1024).toFix
 // npm test — passwords, login, sessions (memory + Redis stores), permissions, reset flow.
 import RedisMock from "ioredis-mock";
 import {
-  AuthError, cleanDeviceSignals, createAuth, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
+  AuthError, cleanDeviceSignals, createAuth, hashTlsFingerprint, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
   permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, SYSTEM_ROLES,
   type AuditSink, type AuthUser, type KeyValueStore, type RateLimiter, type RoleStore, type SessionStore, type UserStore,
 } from "../src/index";
@@ -416,7 +426,7 @@ function fakeDb() {
   const users = new Map<string, AuthUser>();
   const orgs = [{ id: "org-a", code: "MGPL" }, { id: "org-b", code: "OTHER" }];
   const orgRoles: Record<string, { key: string; permissions: string[] }[]> = { "org-a": [{ key: "lab_auditor", permissions: ["audit:read", "accounts:read"] }] };
-  const auditLog: { action: string; userId?: string | null }[] = [];
+  const auditLog: { action: string; userId?: string | null; data?: Record<string, unknown> }[] = [];
   const userStore: UserStore = {
     get: async (id) => (users.has(id) ? { ...users.get(id)! } : null),
     findByEmail: async (orgId, email) => [...users.values()].find((u) => u.orgId === orgId && u.email === email) ?? null,
@@ -625,6 +635,32 @@ async function jwtFlows(label: string, stores: { sessions: SessionStore; kv: Key
   ok(!!h3.accessToken, 'deviceBinding "flag": a refresh from another device works (and is audited)');
   ok(cleanDeviceSignals({ deviceId: "short", fingerprint: "<script>alert(1)</script>xx" }) === undefined, "malformed device ids are dropped");
 
+  // TLS fingerprint (from the proxy, server side): stored hashed, a change is audited, never blocking
+  const JA4 = "t13d1516h2_8daaf6152771_e5627efa2ab1", JA4b = "t13d1517h2_8daaf6152771_b1ff8ab2d16f";
+  const t = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone, tlsFingerprint: JA4 });
+  issued.push(t.refreshToken!, JA4, JA4b);
+  const sidOf = (tok: string) => auth.verifyAccessToken(tok)?.sid;
+  const tStored = (await auth.sessionsOf("j1")).find((x) => x.id === sidOf(t.token));
+  ok(tStored?.tlsFingerprintHash === hashTlsFingerprint(JA4) && tStored?.tlsFingerprintHash !== JA4 && !JSON.stringify(tStored).includes(JA4), "login stores the TLS fingerprint as a hash only");
+  const before = db.auditLog.length;
+  const t2 = await auth.refresh({ refreshToken: t.refreshToken!, device: phone, tlsFingerprint: JA4 });
+  ok(!db.auditLog.slice(before).some((x) => x.action === "auth.tls_fingerprint_changed"), "same TLS fingerprint: nothing audited");
+  const t3 = await auth.refresh({ refreshToken: t2.refreshToken, device: phone, tlsFingerprint: JA4b });
+  issued.push(t2.refreshToken, t3.refreshToken);
+  const tlsAudit = db.auditLog.find((x) => x.action === "auth.tls_fingerprint_changed");
+  ok(!!t3.accessToken && tlsAudit?.data?.from === hashTlsFingerprint(JA4) && tlsAudit?.data?.to === hashTlsFingerprint(JA4b), "new TLS fingerprint: refresh works, change audited (hashes)");
+  ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(t3.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4b), "the session records the latest TLS fingerprint hash");
+  const t4 = await auth.refresh({ refreshToken: t3.refreshToken, device: phone });
+  issued.push(t4.refreshToken);
+  ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(t4.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4b), "a refresh without a TLS fingerprint (TLS ended elsewhere) keeps the stored one");
+  const u = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone });
+  issued.push(u.refreshToken!);
+  const u2 = await auth.refresh({ refreshToken: u.refreshToken!, device: phone, tlsFingerprint: JA4 });
+  issued.push(u2.refreshToken);
+  ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(u2.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4), "a session without one is bound by the first refresh that has one");
+  ok((await code(auth.refresh({ refreshToken: t4.refreshToken, device: { deviceId: "dev-laptop-9999-zzzzzz" }, tlsFingerprint: JA4b }))) === "INVALID_TOKEN" && db.auditLog.some((x) => x.action === "auth.device_mismatch" && x.data?.tls === "same"), "a device mismatch audit says whether the TLS fingerprint matched");
+  ok(hashTlsFingerprint("has space x") === undefined && hashTlsFingerprint("short") === undefined && hashTlsFingerprint("x".repeat(257)) === undefined, "malformed TLS fingerprints are dropped");
+
   let threw = false;
   try { createAuth({ users: db.userStore, sessions: stores.sessions, jwt: { secret: "short" } }); } catch { threw = true; }
   ok(threw, "JWT mode refuses short secrets and a missing kv");
@@ -705,7 +741,8 @@ export interface AuthOptions {
   /**
    * What a refresh from another device does. The device is the `deviceId` the client sent at login.
    * "enforce" (default): refused with INVALID_TOKEN and the session ends (audit auth.device_mismatch).
-   * "flag": allowed, audited. "off": not compared. A changed fingerprint is only audited (auth.fingerprint_changed).
+   * "flag": allowed, audited. "off": not compared. A changed fingerprint is only audited (auth.fingerprint_changed),
+   * and so is a changed TLS fingerprint (auth.tls_fingerprint_changed).
    */
   deviceBinding?: "enforce" | "flag" | "off";
 }
@@ -739,6 +776,11 @@ export interface LoginInput {
   userAgent?: string;
   /** Security signals from the client (device id, fingerprint, …), stored on the session. */
   device?: DeviceSignals;
+  /**
+   * TLS client fingerprint (JA4 / JA3) from the TLS-terminating proxy (security-kit's readTlsFingerprint),
+   * never from client input. Only its hash is stored (`Session.tlsFingerprintHash`).
+   */
+  tlsFingerprint?: string;
 }
 
 export interface LoginResult {
@@ -786,6 +828,12 @@ export function cleanDeviceSignals(d: DeviceSignals | null | undefined): DeviceS
     if (Object.keys(info).length) out.info = info;
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+const TLS_RE = /^[A-Za-z0-9_.:,+\/=-]{8,256}$/;
+/** SHA-256 of a well-formed TLS fingerprint, or undefined. The fingerprint itself is never stored. */
+export function hashTlsFingerprint(v: string | null | undefined): string | undefined {
+  return typeof v === "string" && TLS_RE.test(v) ? hashToken(v) : undefined;
 }
 
 export type Auth = ReturnType<typeof createAuth>;
@@ -838,12 +886,12 @@ export function createAuth(o: AuthOptions) {
     return user ? [user] : [];
   }
 
-  async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals): Promise<{ token: string; session: Session }> {
+  async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals, tlsFingerprint?: string): Promise<{ token: string; session: Session }> {
     const token = randomToken();
     const now = Date.now();
     // JWT mode: the session id is random and never handed out; the refresh token points at it through kv
     const id = jwt ? hashToken(randomToken()) : hashToken(token);
-    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent, device: cleanDeviceSignals(device) };
+    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent, device: cleanDeviceSignals(device), tlsFingerprintHash: hashTlsFingerprint(tlsFingerprint) };
     await o.sessions.create(session, idleMs);
     if (jwt) await o.kv!.set(`refresh:${hashToken(token)}`, id, maxAgeMs);
     return { token, session };
@@ -931,7 +979,7 @@ export function createAuth(o: AuthOptions) {
       const patch: { lastLoginAt: Date; passwordHash?: string } = { lastLoginAt: new Date() };
       if (needsRehash(user.passwordHash)) patch.passwordHash = await hashPassword(input.password);
       await o.users.update(user.id, patch);
-      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device);
+      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device, input.tlsFingerprint);
       await audit({ orgId: user.orgId, userId: user.id, action: "auth.login", ip: input.ip });
       const pub = publicUser({ ...user, lastLoginAt: patch.lastLoginAt });
       if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
@@ -944,7 +992,7 @@ export function createAuth(o: AuthOptions) {
      * Fails with INVALID_TOKEN when the token is unknown, spent, expired, or its session or user is
      * gone. A spent token presented again after `reuseGraceMs` ends the whole session (it was copied).
      */
-    async refresh(input: { refreshToken: string; ip?: string; userAgent?: string; device?: DeviceSignals }): Promise<TokenPair> {
+    async refresh(input: { refreshToken: string; ip?: string; userAgent?: string; device?: DeviceSignals; tlsFingerprint?: string }): Promise<TokenPair> {
       if (!jwt) throw new Error("createAuth: refresh needs the `jwt` option");
       const invalid = () => new AuthError("INVALID_TOKEN", "Sign in again");
       const rt = input.refreshToken ?? "";
@@ -976,9 +1024,12 @@ export function createAuth(o: AuthOptions) {
       // device binding: the refresh token only works on the device that signed in
       const device = cleanDeviceSignals(input.device);
       const bound = s.device?.deviceId;
+      // TLS fingerprint (server side, hashed): "same" / "changed", or null when either side has none
+      const tls = hashTlsFingerprint(input.tlsFingerprint);
+      const tlsVerdict = tls && s.tlsFingerprintHash ? (tls === s.tlsFingerprintHash ? "same" : "changed") : null;
       let session = s;
       if (deviceBinding !== "off" && bound && device?.deviceId !== bound) {
-        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null } });
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null, tls: tlsVerdict } });
         if (deviceBinding === "enforce") {
           await o.sessions.delete(s.id);
           throw invalid();
@@ -987,9 +1038,13 @@ export function createAuth(o: AuthOptions) {
       if (device?.fingerprint && s.device?.fingerprint && device.fingerprint !== s.device.fingerprint) {
         await audit({ orgId: s.orgId, userId: s.userId, action: "auth.fingerprint_changed", ip: input.ip, entity: "session", data: { from: s.device.fingerprint, to: device.fingerprint } });
       }
-      if (device && (device.fingerprint !== s.device?.fingerprint || device.clientSessionId !== s.device?.clientSessionId || input.ip !== s.ip)) {
-        // keep the device id from login; record the latest fingerprint, tab, info and address
-        session = { ...s, lastSeenAt: now, ip: input.ip ?? s.ip, userAgent: input.userAgent ?? s.userAgent, device: { ...s.device, ...device, deviceId: bound ?? device.deviceId } };
+      if (tlsVerdict === "changed") {
+        // browser updates and TLS-inspecting middleboxes change it too, so it is logged, never blocking
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.tls_fingerprint_changed", ip: input.ip, entity: "session", data: { from: s.tlsFingerprintHash, to: tls } });
+      }
+      if ((device && (device.fingerprint !== s.device?.fingerprint || device.clientSessionId !== s.device?.clientSessionId || input.ip !== s.ip)) || (tls && tls !== s.tlsFingerprintHash)) {
+        // keep the device id from login; record the latest fingerprint, tab, info, address and TLS fingerprint
+        session = { ...s, lastSeenAt: now, ip: input.ip ?? s.ip, userAgent: input.userAgent ?? s.userAgent, device: device ? { ...s.device, ...device, deviceId: bound ?? device.deviceId } : s.device, tlsFingerprintHash: tls ?? s.tlsFingerprintHash };
         await o.sessions.create(session, idleMs);
       } else {
         await o.sessions.touch(s.id, now, idleMs);
@@ -1171,7 +1226,7 @@ export class AuthError extends Error {
 ## File: src/index.ts
 
 ```ts
-export { cleanDeviceSignals, createAuth, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type TokenPair, type Viewer } from "./auth";
+export { cleanDeviceSignals, createAuth, hashTlsFingerprint, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type TokenPair, type Viewer } from "./auth";
 export { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./jwt";
 export { AuthError, type AuthErrorCode } from "./errors";
 export { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, SCRYPT, verifyPassword, type PasswordPolicy } from "./password";
@@ -1718,6 +1773,8 @@ export interface Session {
   userAgent?: string;
   /** What the client said about its device at login (and the latest fingerprint). See DeviceSignals. */
   device?: DeviceSignals;
+  /** SHA-256 of the TLS client fingerprint (JA4 / JA3) the proxy reported at login, then the latest one. */
+  tlsFingerprintHash?: string;
 }
 
 /**

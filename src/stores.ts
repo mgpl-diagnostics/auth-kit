@@ -55,6 +55,8 @@ export interface Session {
   userAgent?: string;
   /** What the client said about its device at login (and the latest fingerprint). See DeviceSignals. */
   device?: DeviceSignals;
+  /** SHA-256 of the TLS client fingerprint (JA4 / JA3) the proxy reported at login, then the latest one. */
+  tlsFingerprintHash?: string;
 }
 
 /**

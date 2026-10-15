@@ -3,7 +3,7 @@
 **Authentication and permissions for the MGPL Diagnostics backend, as an internal API.**
 There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jobs) calls these functions.
 
-![tests](https://img.shields.io/badge/checks-110-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
+![tests](https://img.shields.io/badge/checks-126-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
 
 ## What it does
 
@@ -109,12 +109,20 @@ Clients can send security signals with `login` and `refresh` (`device: DeviceSig
 A session that signed in without a `deviceId` is bound by the first refresh that sends one.
 `sessionsOf` returns `device`, so a "your devices" page can show it.
 
+**TLS fingerprint.** The server can also pass `tlsFingerprint` (JA4 or JA3) to `login` and `refresh`. It
+is computed by whatever terminates TLS, so it never comes from the client: read it with security-kit's
+`readTlsFingerprint` (a header set by a trusted proxy). Only its SHA-256 (`hashTlsFingerprint`) is stored,
+as `Session.tlsFingerprintHash`. On refresh a different one is audited (`auth.tls_fingerprint_changed`,
+with both hashes) and the latest is kept; it never blocks, because browser updates and TLS-inspecting
+networks change it. A refresh without one keeps the stored hash, and `auth.device_mismatch` records
+`tls: "same" | "changed" | null`, which helps tell a copied token from a cleared browser.
+
 ## API
 
 | Call | Returns / throws |
 | --- | --- |
-| `login({ email, password, orgCode?, ip?, userAgent?, device? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
-| `refresh({ refreshToken, ip?, userAgent?, device? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
+| `login({ email, password, orgCode?, ip?, userAgent?, device?, tlsFingerprint? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `refresh({ refreshToken, ip?, userAgent?, device?, tlsFingerprint? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
 | `verifyAccessToken(token)` | JWT mode: claims `{ sub, org, sid, iat, exp }` or null, no storage read |
 | `authenticate(token)` | `Viewer \| null` (slides the idle window) |
 | `context(token)` | `{ viewer, can, branchesFor, permissions }` (anonymous when the token is missing or invalid) |
@@ -131,7 +139,7 @@ Also exported:
 - `hashPassword`, `verifyPassword`, `needsRehash`, `assertPasswordPolicy`;
 - `randomToken`, `hashToken`;
 - `jwtSigner`, `looksLikeJwt` (HS256 sign/verify on node:crypto);
-- `cleanDeviceSignals` and the `DeviceSignals` type;
+- `cleanDeviceSignals` and the `DeviceSignals` type; `hashTlsFingerprint`;
 - `PERMISSIONS`, `SYSTEM_ROLES`;
 - `can`, `branchesFor`, `permissionsOf`, `roleMap`.
 
