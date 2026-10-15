@@ -1,4 +1,4 @@
-export { cleanDeviceSignals, createAuth, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type TokenPair, type Viewer } from "./auth";
+export { cleanDeviceSignals, createAuth, hashTlsFingerprint, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type TokenPair, type Viewer } from "./auth";
 export { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./jwt";
 export { AuthError, type AuthErrorCode } from "./errors";
 export { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, SCRYPT, verifyPassword, type PasswordPolicy } from "./password";

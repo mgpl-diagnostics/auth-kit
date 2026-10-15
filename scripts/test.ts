@@ -1,7 +1,7 @@
 // npm test — passwords, login, sessions (memory + Redis stores), permissions, reset flow.
 import RedisMock from "ioredis-mock";
 import {
-  AuthError, cleanDeviceSignals, createAuth, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
+  AuthError, cleanDeviceSignals, createAuth, hashTlsFingerprint, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
   permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, SYSTEM_ROLES,
   type AuditSink, type AuthUser, type KeyValueStore, type RateLimiter, type RoleStore, type SessionStore, type UserStore,
 } from "../src/index";
@@ -21,7 +21,7 @@ function fakeDb() {
   const users = new Map<string, AuthUser>();
   const orgs = [{ id: "org-a", code: "MGPL" }, { id: "org-b", code: "OTHER" }];
   const orgRoles: Record<string, { key: string; permissions: string[] }[]> = { "org-a": [{ key: "lab_auditor", permissions: ["audit:read", "accounts:read"] }] };
-  const auditLog: { action: string; userId?: string | null }[] = [];
+  const auditLog: { action: string; userId?: string | null; data?: Record<string, unknown> }[] = [];
   const userStore: UserStore = {
     get: async (id) => (users.has(id) ? { ...users.get(id)! } : null),
     findByEmail: async (orgId, email) => [...users.values()].find((u) => u.orgId === orgId && u.email === email) ?? null,
@@ -229,6 +229,32 @@ async function jwtFlows(label: string, stores: { sessions: SessionStore; kv: Key
   issued.push(h3.refreshToken);
   ok(!!h3.accessToken, 'deviceBinding "flag": a refresh from another device works (and is audited)');
   ok(cleanDeviceSignals({ deviceId: "short", fingerprint: "<script>alert(1)</script>xx" }) === undefined, "malformed device ids are dropped");
+
+  // TLS fingerprint (from the proxy, server side): stored hashed, a change is audited, never blocking
+  const JA4 = "t13d1516h2_8daaf6152771_e5627efa2ab1", JA4b = "t13d1517h2_8daaf6152771_b1ff8ab2d16f";
+  const t = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone, tlsFingerprint: JA4 });
+  issued.push(t.refreshToken!, JA4, JA4b);
+  const sidOf = (tok: string) => auth.verifyAccessToken(tok)?.sid;
+  const tStored = (await auth.sessionsOf("j1")).find((x) => x.id === sidOf(t.token));
+  ok(tStored?.tlsFingerprintHash === hashTlsFingerprint(JA4) && tStored?.tlsFingerprintHash !== JA4 && !JSON.stringify(tStored).includes(JA4), "login stores the TLS fingerprint as a hash only");
+  const before = db.auditLog.length;
+  const t2 = await auth.refresh({ refreshToken: t.refreshToken!, device: phone, tlsFingerprint: JA4 });
+  ok(!db.auditLog.slice(before).some((x) => x.action === "auth.tls_fingerprint_changed"), "same TLS fingerprint: nothing audited");
+  const t3 = await auth.refresh({ refreshToken: t2.refreshToken, device: phone, tlsFingerprint: JA4b });
+  issued.push(t2.refreshToken, t3.refreshToken);
+  const tlsAudit = db.auditLog.find((x) => x.action === "auth.tls_fingerprint_changed");
+  ok(!!t3.accessToken && tlsAudit?.data?.from === hashTlsFingerprint(JA4) && tlsAudit?.data?.to === hashTlsFingerprint(JA4b), "new TLS fingerprint: refresh works, change audited (hashes)");
+  ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(t3.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4b), "the session records the latest TLS fingerprint hash");
+  const t4 = await auth.refresh({ refreshToken: t3.refreshToken, device: phone });
+  issued.push(t4.refreshToken);
+  ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(t4.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4b), "a refresh without a TLS fingerprint (TLS ended elsewhere) keeps the stored one");
+  const u = await auth.login({ email: "asha@mgpl.in", password: "banyan-roots-7", device: phone });
+  issued.push(u.refreshToken!);
+  const u2 = await auth.refresh({ refreshToken: u.refreshToken!, device: phone, tlsFingerprint: JA4 });
+  issued.push(u2.refreshToken);
+  ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(u2.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4), "a session without one is bound by the first refresh that has one");
+  ok((await code(auth.refresh({ refreshToken: t4.refreshToken, device: { deviceId: "dev-laptop-9999-zzzzzz" }, tlsFingerprint: JA4b }))) === "INVALID_TOKEN" && db.auditLog.some((x) => x.action === "auth.device_mismatch" && x.data?.tls === "same"), "a device mismatch audit says whether the TLS fingerprint matched");
+  ok(hashTlsFingerprint("has space x") === undefined && hashTlsFingerprint("short") === undefined && hashTlsFingerprint("x".repeat(257)) === undefined, "malformed TLS fingerprints are dropped");
 
   let threw = false;
   try { createAuth({ users: db.userStore, sessions: stores.sessions, jwt: { secret: "short" } }); } catch { threw = true; }

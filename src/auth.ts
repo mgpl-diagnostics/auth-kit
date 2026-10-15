@@ -47,7 +47,8 @@ export interface AuthOptions {
   /**
    * What a refresh from another device does. The device is the `deviceId` the client sent at login.
    * "enforce" (default): refused with INVALID_TOKEN and the session ends (audit auth.device_mismatch).
-   * "flag": allowed, audited. "off": not compared. A changed fingerprint is only audited (auth.fingerprint_changed).
+   * "flag": allowed, audited. "off": not compared. A changed fingerprint is only audited (auth.fingerprint_changed),
+   * and so is a changed TLS fingerprint (auth.tls_fingerprint_changed).
    */
   deviceBinding?: "enforce" | "flag" | "off";
 }
@@ -81,6 +82,11 @@ export interface LoginInput {
   userAgent?: string;
   /** Security signals from the client (device id, fingerprint, …), stored on the session. */
   device?: DeviceSignals;
+  /**
+   * TLS client fingerprint (JA4 / JA3) from the TLS-terminating proxy (security-kit's readTlsFingerprint),
+   * never from client input. Only its hash is stored (`Session.tlsFingerprintHash`).
+   */
+  tlsFingerprint?: string;
 }
 
 export interface LoginResult {
@@ -128,6 +134,12 @@ export function cleanDeviceSignals(d: DeviceSignals | null | undefined): DeviceS
     if (Object.keys(info).length) out.info = info;
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+const TLS_RE = /^[A-Za-z0-9_.:,+\/=-]{8,256}$/;
+/** SHA-256 of a well-formed TLS fingerprint, or undefined. The fingerprint itself is never stored. */
+export function hashTlsFingerprint(v: string | null | undefined): string | undefined {
+  return typeof v === "string" && TLS_RE.test(v) ? hashToken(v) : undefined;
 }
 
 export type Auth = ReturnType<typeof createAuth>;
@@ -180,12 +192,12 @@ export function createAuth(o: AuthOptions) {
     return user ? [user] : [];
   }
 
-  async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals): Promise<{ token: string; session: Session }> {
+  async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals, tlsFingerprint?: string): Promise<{ token: string; session: Session }> {
     const token = randomToken();
     const now = Date.now();
     // JWT mode: the session id is random and never handed out; the refresh token points at it through kv
     const id = jwt ? hashToken(randomToken()) : hashToken(token);
-    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent, device: cleanDeviceSignals(device) };
+    const session: Session = { id, userId: user.id, orgId: user.orgId, createdAt: now, lastSeenAt: now, expiresAt: now + maxAgeMs, ip, userAgent, device: cleanDeviceSignals(device), tlsFingerprintHash: hashTlsFingerprint(tlsFingerprint) };
     await o.sessions.create(session, idleMs);
     if (jwt) await o.kv!.set(`refresh:${hashToken(token)}`, id, maxAgeMs);
     return { token, session };
@@ -273,7 +285,7 @@ export function createAuth(o: AuthOptions) {
       const patch: { lastLoginAt: Date; passwordHash?: string } = { lastLoginAt: new Date() };
       if (needsRehash(user.passwordHash)) patch.passwordHash = await hashPassword(input.password);
       await o.users.update(user.id, patch);
-      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device);
+      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device, input.tlsFingerprint);
       await audit({ orgId: user.orgId, userId: user.id, action: "auth.login", ip: input.ip });
       const pub = publicUser({ ...user, lastLoginAt: patch.lastLoginAt });
       if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
@@ -286,7 +298,7 @@ export function createAuth(o: AuthOptions) {
      * Fails with INVALID_TOKEN when the token is unknown, spent, expired, or its session or user is
      * gone. A spent token presented again after `reuseGraceMs` ends the whole session (it was copied).
      */
-    async refresh(input: { refreshToken: string; ip?: string; userAgent?: string; device?: DeviceSignals }): Promise<TokenPair> {
+    async refresh(input: { refreshToken: string; ip?: string; userAgent?: string; device?: DeviceSignals; tlsFingerprint?: string }): Promise<TokenPair> {
       if (!jwt) throw new Error("createAuth: refresh needs the `jwt` option");
       const invalid = () => new AuthError("INVALID_TOKEN", "Sign in again");
       const rt = input.refreshToken ?? "";
@@ -318,9 +330,12 @@ export function createAuth(o: AuthOptions) {
       // device binding: the refresh token only works on the device that signed in
       const device = cleanDeviceSignals(input.device);
       const bound = s.device?.deviceId;
+      // TLS fingerprint (server side, hashed): "same" / "changed", or null when either side has none
+      const tls = hashTlsFingerprint(input.tlsFingerprint);
+      const tlsVerdict = tls && s.tlsFingerprintHash ? (tls === s.tlsFingerprintHash ? "same" : "changed") : null;
       let session = s;
       if (deviceBinding !== "off" && bound && device?.deviceId !== bound) {
-        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null } });
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null, tls: tlsVerdict } });
         if (deviceBinding === "enforce") {
           await o.sessions.delete(s.id);
           throw invalid();
@@ -329,9 +344,13 @@ export function createAuth(o: AuthOptions) {
       if (device?.fingerprint && s.device?.fingerprint && device.fingerprint !== s.device.fingerprint) {
         await audit({ orgId: s.orgId, userId: s.userId, action: "auth.fingerprint_changed", ip: input.ip, entity: "session", data: { from: s.device.fingerprint, to: device.fingerprint } });
       }
-      if (device && (device.fingerprint !== s.device?.fingerprint || device.clientSessionId !== s.device?.clientSessionId || input.ip !== s.ip)) {
-        // keep the device id from login; record the latest fingerprint, tab, info and address
-        session = { ...s, lastSeenAt: now, ip: input.ip ?? s.ip, userAgent: input.userAgent ?? s.userAgent, device: { ...s.device, ...device, deviceId: bound ?? device.deviceId } };
+      if (tlsVerdict === "changed") {
+        // browser updates and TLS-inspecting middleboxes change it too, so it is logged, never blocking
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.tls_fingerprint_changed", ip: input.ip, entity: "session", data: { from: s.tlsFingerprintHash, to: tls } });
+      }
+      if ((device && (device.fingerprint !== s.device?.fingerprint || device.clientSessionId !== s.device?.clientSessionId || input.ip !== s.ip)) || (tls && tls !== s.tlsFingerprintHash)) {
+        // keep the device id from login; record the latest fingerprint, tab, info, address and TLS fingerprint
+        session = { ...s, lastSeenAt: now, ip: input.ip ?? s.ip, userAgent: input.userAgent ?? s.userAgent, device: device ? { ...s.device, ...device, deviceId: bound ?? device.deviceId } : s.device, tlsFingerprintHash: tls ?? s.tlsFingerprintHash };
         await o.sessions.create(session, idleMs);
       } else {
         await o.sessions.touch(s.id, now, idleMs);
