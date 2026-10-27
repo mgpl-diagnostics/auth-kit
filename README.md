@@ -3,14 +3,14 @@
 **Authentication and permissions for the MGPL Diagnostics backend, as an internal API.**
 There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jobs) calls these functions.
 
-![tests](https://img.shields.io/badge/checks-126-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
+![tests](https://img.shields.io/badge/checks-128-14264A) ![deps](https://img.shields.io/badge/runtime%20dependencies-0-E9A23B)
 
 ## What it does
 
 | | |
 | --- | --- |
 | **Passwords** | scrypt (N=2¹⁵), salted, self-describing hashes; weaker hashes upgraded on the next login; NIST-style policy (length, common passwords, repeated characters, no email) |
-| **Login** | rate-limited per IP and per email; timing-safe (an unknown email costs the same as a wrong password); same email in several organisations → `ORG_REQUIRED`; audited |
+| **Login** | rate-limited per IP (failed attempts only: an office of staff on one connection can all sign in) and per email; timing-safe (an unknown email costs the same as a wrong password); same email in several organisations → `ORG_REQUIRED`; audited |
 | **Sessions** | opaque tokens, stored only as SHA-256; idle timeout that slides with use plus an absolute maximum age; list devices, revoke one, log out everywhere |
 | **JWT mode** | short-lived HS256 access tokens plus single-use refresh tokens, rotated on every refresh; a refresh token used twice ends its session (theft); secret rotation; logout and revocation still apply at once |
 | **Accounts** | disabling a user or changing roles applies on the very next request |

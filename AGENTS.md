@@ -13,7 +13,7 @@ src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, 
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
 src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  126 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
+scripts/test.ts  128 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules

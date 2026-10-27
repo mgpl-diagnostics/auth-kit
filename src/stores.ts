@@ -96,4 +96,6 @@ export interface KeyValueStore {
 export interface RateLimiter {
   hit(key: string): Promise<{ allowed: boolean; retryAfterMs: number }>;
   reset(key: string): Promise<void>;
+  /** Takes back the latest hit on `key` (a successful login does not count against its IP). Optional. */
+  undo?(key: string): Promise<void>;
 }

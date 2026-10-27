@@ -145,6 +145,12 @@ async function flows(label: string, stores: { sessions: SessionStore; kv: KeyVal
   const codes: string[] = [];
   for (let i = 0; i < 4; i++) codes.push(await code(strict.login({ email: "old@mgpl.in", password: "bad-guess-000", ip: "9.9.9.9" })));
   ok(codes.slice(0, 3).every((c) => c === "INVALID_CREDENTIALS") && codes[3] === "RATE_LIMITED", "4th attempt from the same IP/email → RATE_LIMITED");
+  const office = createAuth({ users: db.userStore, sessions: stores.sessions, limiter: label === "redis" ? redisRateLimiter(new RedisMock() as any, { limit: 3, windowMs: 60_000, prefix: `rlo${Date.now()}:` }) : memoryRateLimiter({ limit: 3, windowMs: 60_000 }) });
+  let signedIn = 0;
+  for (let i = 0; i < 6; i++) if ((await office.login({ email: "asha@mgpl.in", password: "peepal-shade-12", ip: "7.7.7.7" })).user) signedIn++;
+  const guesses: string[] = [];
+  for (let i = 0; i < 4; i++) guesses.push(await code(office.login({ email: `nobody${i}@mgpl.in`, password: "bad-guess-000", ip: "7.7.7.7" })));
+  ok(signedIn === 6 && guesses.slice(0, 3).every((c) => c === "INVALID_CREDENTIALS") && guesses[3] === "RATE_LIMITED", "successful logins do not use up the IP's limit (shared office connection); failures still do");
 
   ok(db.auditLog.some((e) => e.action === "auth.login") && db.auditLog.some((e) => e.action === "auth.login_failed") && db.auditLog.some((e) => e.action === "auth.password_reset"), "audit trail written");
 }
