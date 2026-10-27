@@ -77,5 +77,8 @@ export function memoryRateLimiter(o: { limit: number; windowMs: number }): RateL
     async reset(key) {
       hits.delete(key);
     },
+    async undo(key) {
+      hits.get(key)?.pop();
+    },
   };
 }

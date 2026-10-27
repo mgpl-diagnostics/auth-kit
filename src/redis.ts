@@ -97,5 +97,8 @@ export function redisRateLimiter(redis: Redis, o: { limit: number; windowMs: num
     async reset(k) {
       await redis.del(prefix + k);
     },
+    async undo(k) {
+      await redis.zpopmax(prefix + k);
+    },
   };
 }

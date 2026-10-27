@@ -282,6 +282,9 @@ export function createAuth(o: AuthOptions) {
       if (user.status === "invited") throw new AuthError("INVITE_PENDING", "Accept your invitation first");
 
       await limiter.reset(`login:email:${email}`);
+      // only failed attempts count against the IP: staff behind one office connection must all be able to
+      // sign in. Every attempt is still counted first, so a burst of guesses is blocked before verification.
+      if (input.ip) await limiter.undo?.(`login:ip:${input.ip}`);
       const patch: { lastLoginAt: Date; passwordHash?: string } = { lastLoginAt: new Date() };
       if (needsRehash(user.passwordHash)) patch.passwordHash = await hashPassword(input.password);
       await o.users.update(user.id, patch);
