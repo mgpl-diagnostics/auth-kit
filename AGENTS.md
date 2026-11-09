@@ -13,7 +13,7 @@ src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, 
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
 src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  128 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
+scripts/test.ts  131 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules
@@ -23,7 +23,8 @@ scripts/test.ts  128 checks; session, JWT, device-binding and TLS-fingerprint fl
 3. **Every request re-reads the user** (`authenticate`), so disabling and role changes apply at once. Do not cache users across requests.
 4. Interfaces stay **structural and small**. db-kit's repositories must keep satisfying them (users, orgs, roles, audit).
 5. Permissions the backend checks must exist in `PERMISSIONS` and be granted by the right `SYSTEM_ROLES`
-   (db-kit's resolvers need `accounts:read|post|manage`, among others).
+   (db-kit's resolvers need `accounts:read|post|manage`, among others; the api's partner-lab imports need
+   `report:import` and `signatory:read|manage`).
 6. **JWT mode keeps rules 1 and 3.** Access JWTs carry the session id and every request still checks the
    session and re-reads the user; refresh tokens are opaque, single-use and stored as hashes. Never accept
    `alg` from the token (HS256 only), never sign with a secret under 32 characters.

@@ -18,6 +18,10 @@ export const PERMISSIONS = [
   "booking:read", "booking:create", "booking:update", "booking:cancel",
   "sample:read", "sample:collect", "sample:receive", "sample:reject",
   "report:read", "report:enter", "report:verify", "report:release", "report:amend",
+  // partner-lab PDF imports: upload, match to a booking, apply results (report-reader in the api)
+  "report:import",
+  // the partner signature registry: name a partner doctor's signature, edit or remove it
+  "signatory:read", "signatory:manage",
   "invoice:read", "invoice:create", "invoice:discount", "invoice:cancel",
   "payment:read", "payment:create", "payment:refund",
   "accounts:read", "accounts:post", "accounts:manage",
@@ -39,7 +43,7 @@ export const SYSTEM_ROLES: RoleDefinition[] = [
   {
     key: "admin",
     name: "Administrator",
-    permissions: ["org:read", "branch:*", "user:*", "role:*", "patient:*", "doctor:*", "booking:*", "sample:*", "report:*", "invoice:*", "payment:*", "accounts:*", "audit:read", "settings:manage"],
+    permissions: ["org:read", "branch:*", "user:*", "role:*", "patient:*", "doctor:*", "booking:*", "sample:*", "report:*", "signatory:*", "invoice:*", "payment:*", "accounts:*", "audit:read", "settings:manage"],
   },
   {
     key: "branch_manager",
@@ -52,8 +56,8 @@ export const SYSTEM_ROLES: RoleDefinition[] = [
     permissions: ["org:read", "branch:read", "patient:read", "patient:create", "patient:update", "doctor:read", "booking:read", "booking:create", "booking:update", "sample:read", "report:read", "invoice:read", "invoice:create", "payment:read", "payment:create"],
   },
   { key: "phlebotomist", name: "Phlebotomist", permissions: ["branch:read", "patient:read", "booking:read", "sample:read", "sample:collect"] },
-  { key: "technician", name: "Lab technician", permissions: ["branch:read", "patient:read", "booking:read", "sample:*", "report:read", "report:enter"] },
-  { key: "pathologist", name: "Pathologist", permissions: ["branch:read", "patient:read", "booking:read", "sample:read", "report:*"] },
+  { key: "technician", name: "Lab technician", permissions: ["branch:read", "patient:read", "booking:read", "sample:*", "report:read", "report:enter", "report:import", "signatory:read"] },
+  { key: "pathologist", name: "Pathologist", permissions: ["branch:read", "patient:read", "booking:read", "sample:read", "report:*", "signatory:*"] },
   { key: "accountant", name: "Accountant", permissions: ["org:read", "branch:read", "patient:read", "invoice:read", "invoice:cancel", "payment:*", "accounts:*", "audit:read"] },
   { key: "doctor", name: "Referring doctor", permissions: ["patient:read", "report:read"] },
 ];
