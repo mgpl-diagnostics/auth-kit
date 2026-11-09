@@ -19,7 +19,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function fakeDb() {
   const users = new Map<string, AuthUser>();
-  const orgs = [{ id: "org-a", code: "MGPL" }, { id: "org-b", code: "OTHER" }];
+  const orgs = [{ id: "org-a", code: "MGPL", name: "Maa Gayatri Path Lab" }, { id: "org-b", code: "OTHER", name: "Arang Collection Centre" }, { id: "org-c", code: "THIRD", name: "Third Lab" }];
   const orgRoles: Record<string, { key: string; permissions: string[] }[]> = { "org-a": [{ key: "lab_auditor", permissions: ["audit:read", "accounts:read"] }] };
   const auditLog: { action: string; userId?: string | null; data?: Record<string, unknown> }[] = [];
   const userStore: UserStore = {
@@ -33,7 +33,7 @@ function fakeDb() {
   const add = async (u: Omit<AuthUser, "passwordHash"> & { password: string; hashParams?: { N: number; r: number; p: number } }) => {
     users.set(u.id, { ...u, passwordHash: await hashPassword(u.password, u.hashParams) });
   };
-  return { users, userStore, orgStore: { findOne: async ({ code }: { code: string }) => orgs.find((o) => o.code === code) ?? null }, roleStore, audit, auditLog, orgRoles, add };
+  return { users, userStore, orgStore: { findOne: async ({ code }: { code: string }) => orgs.find((o) => o.code === code) ?? null, get: async (id: string) => orgs.find((o) => o.id === id) ?? null }, roleStore, audit, auditLog, orgRoles, add };
 }
 
 // ------------------------------------------------------------------ unit: passwords & RBAC
@@ -92,6 +92,26 @@ async function flows(label: string, stores: { sessions: SessionStore; kv: KeyVal
   ok((await code(auth.login({ email: "gone@mgpl.in", password: "mango-season-27" }))) === "ACCOUNT_DISABLED", "disabled account → ACCOUNT_DISABLED");
   ok((await code(auth.login({ email: "dual@x.in", password: "shared-pass-99" }))) === "ORG_REQUIRED", "same email in two organisations → ORG_REQUIRED");
   ok((await auth.login({ email: "dual@x.in", password: "shared-pass-99", orgCode: "other" })).user.id === "u5", "…with orgCode → the right one");
+
+  // choosing and switching organisations
+  await db.add({ id: "u6", orgId: "org-c", name: "Dual C", email: "dual@x.in", password: "different-pass-77", status: "active", roles: [] });
+  const orgErr = await auth.login({ email: "dual@x.in", password: "shared-pass-99" }).catch((e: AuthError) => e);
+  ok(orgErr instanceof AuthError && orgErr.details.organizations?.map((x) => x.code).join() === "OTHER,MGPL" && orgErr.details.organizations[0]!.name === "Arang Collection Centre", "ORG_REQUIRED names the organisations whose password matched (sorted by name), not the others");
+  const wrongErr = await auth.login({ email: "dual@x.in", password: "wrong-password-1" }).catch((e: AuthError) => e);
+  ok(wrongErr instanceof AuthError && wrongErr.code === "INVALID_CREDENTIALS" && !wrongErr.details.organizations, "a wrong password names no organisation");
+  const inA = await auth.login({ email: "dual@x.in", password: "shared-pass-99", orgCode: "MGPL", ip: "2.2.2.2" });
+  ok((await auth.organizationsOf("u4")).map((x) => x.code).join() === "OTHER,MGPL,THIRD" && (await auth.organizationsOf("u1")).length === 1, "organizationsOf: every active account with the same email, the current one included");
+  const toB = await auth.switchOrganization({ token: inA.token, orgId: "org-b", ip: "2.2.2.2" });
+  ok(toB.user.id === "u5" && (await auth.authenticate(toB.token))?.orgId === "org-b" && (await auth.authenticate(inA.token)) === null, "switchOrganization: new session in the other organisation, the old one ends");
+  ok(db.auditLog.some((x) => x.action === "auth.org_switch_out" && x.userId === "u4" && x.data?.to === "org-b") && db.auditLog.some((x) => x.action === "auth.org_switch" && x.userId === "u5" && x.data?.from === "org-a"), "switch audited in both organisations");
+  ok((await code(auth.switchOrganization({ token: toB.token, orgId: "org-b" }))) === "ORG_UNAVAILABLE" && (await code(auth.switchOrganization({ token: toB.token, orgId: "org-x" }))) === "ORG_UNAVAILABLE", "switching to the same or an unknown organisation → ORG_UNAVAILABLE");
+  ok((await code(auth.switchOrganization({ token: login.token.replace(/.$/, "x"), orgId: "org-b" }))) === "UNAUTHENTICATED", "switching needs a valid session");
+  const asha = await auth.login({ email: "asha@mgpl.in", password: "tulsi-leaf-raipur" });
+  ok((await code(auth.switchOrganization({ token: asha.token, orgId: "org-b" }))) === "ORG_UNAVAILABLE", "no account with that email there → ORG_UNAVAILABLE");
+  await auth.logout(asha.token);
+  db.users.set("u4", { ...db.users.get("u4")!, status: "disabled" });
+  ok((await code(auth.switchOrganization({ token: toB.token, orgId: "org-a" }))) === "ORG_UNAVAILABLE" && !(await auth.organizationsOf("u5")).some((x) => x.orgId === "org-a"), "a disabled account there cannot be switched to or listed");
+  db.users.set("u4", { ...db.users.get("u4")!, status: "active" });
 
   const before = db.users.get("u2")!.passwordHash;
   await auth.login({ email: "old@mgpl.in", password: "neem-tree-arang" });
@@ -265,6 +285,20 @@ async function jwtFlows(label: string, stores: { sessions: SessionStore; kv: Key
   issued.push(u2.refreshToken);
   ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(u2.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4), "a session without one is bound by the first refresh that has one");
   ok((await code(auth.refresh({ refreshToken: t4.refreshToken, device: { deviceId: "dev-laptop-9999-zzzzzz" }, tlsFingerprint: JA4b }))) === "INVALID_TOKEN" && db.auditLog.some((x) => x.action === "auth.device_mismatch" && x.data?.tls === "same"), "a device mismatch audit says whether the TLS fingerprint matched");
+  // switching organisations in JWT mode keeps the device binding
+  await db.add({ id: "j8", orgId: "org-a", name: "Two A", email: "two@x.in", password: "shared-pass-99", status: "active", roles: [] });
+  await db.add({ id: "j9", orgId: "org-b", name: "Two B", email: "two@x.in", password: "shared-pass-99", status: "active", roles: [] });
+  const sw = createAuth({ users: db.userStore, orgs: db.orgStore, audit: db.audit, ...stores, jwt: { secret: SECRET } });
+  const dev = { deviceId: "dev-switch-0001-abcdef" };
+  const s1 = await sw.login({ email: "two@x.in", password: "shared-pass-99", orgCode: "MGPL", device: dev });
+  ok((await code(sw.switchOrganization({ token: s1.token, orgId: "org-b", device: { deviceId: "dev-other-0002-zzzzzz" } }))) === "INVALID_TOKEN" && (await sw.authenticate(s1.token)) === null, "switch from another device: refused, session ended");
+  const s2 = await sw.login({ email: "two@x.in", password: "shared-pass-99", orgCode: "MGPL", device: dev });
+  const s3 = await sw.switchOrganization({ token: s2.token, orgId: "org-b", device: dev });
+  ok(!!s3.refreshToken && (await sw.authenticate(s3.token))?.userId === "j9" && (await code(sw.refresh({ refreshToken: s2.refreshToken!, device: dev }))) === "INVALID_TOKEN", "switch in JWT mode: new access + refresh token; the old refresh token is dead");
+  const s4 = await sw.refresh({ refreshToken: s3.refreshToken!, device: dev });
+  ok(s4.user.id === "j9", "the switched session refreshes on the same device");
+  issued.push(s3.refreshToken!, s4.refreshToken);
+
   ok(hashTlsFingerprint("has space x") === undefined && hashTlsFingerprint("short") === undefined && hashTlsFingerprint("x".repeat(257)) === undefined, "malformed TLS fingerprints are dropped");
 
   let threw = false;

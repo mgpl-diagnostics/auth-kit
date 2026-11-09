@@ -3,7 +3,7 @@ import { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./j
 import { memoryRateLimiter } from "./memory";
 import { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, verifyPassword, type PasswordPolicy } from "./password";
 import { branchesFor, can, permissionsOf, roleMap, type Permission, type RoleAssignment, type RoleMap } from "./rbac";
-import type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
+import type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgChoice, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
 
 export interface AuthOptions {
   users: UserStore;
@@ -103,6 +103,17 @@ export interface LoginResult {
   refreshExpiresAt?: Date;
 }
 
+/** Moving a signed-in person to their account in another organisation (same email). */
+export interface SwitchOrganizationInput {
+  /** The current access token (JWT mode) or session token. Its session ends when the switch succeeds. */
+  token: string;
+  orgId: string;
+  ip?: string;
+  userAgent?: string;
+  device?: DeviceSignals;
+  tlsFingerprint?: string;
+}
+
 /** What `refresh` returns: a new access token and the next refresh token (the old one is spent). */
 export interface TokenPair {
   accessToken: string;
@@ -192,6 +203,29 @@ export function createAuth(o: AuthOptions) {
     return user ? [user] : [];
   }
 
+  /** The organisations of these accounts, named, sorted by name. Empty without `orgs.get`. */
+  async function choicesFor(users: AuthUser[]): Promise<OrgChoice[]> {
+    if (!o.orgs?.get) return [];
+    const out: OrgChoice[] = [];
+    for (const u of users) {
+      const org = await o.orgs.get(u.orgId);
+      if (org) out.push({ orgId: org.id, code: org.code, name: org.name || org.code });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Signs a user in on a new session: last login, audit, and the token(s) for the client. */
+  async function issue(user: AuthUser, s: { ip?: string; userAgent?: string; device?: DeviceSignals; tlsFingerprint?: string }, action: string, data?: Record<string, unknown>): Promise<LoginResult> {
+    const lastLoginAt = new Date();
+    await o.users.update(user.id, { lastLoginAt });
+    const { token, session } = await startSession(user, s.ip, s.userAgent, s.device, s.tlsFingerprint);
+    await audit({ orgId: user.orgId, userId: user.id, action, ip: s.ip, ...(data ? { data } : {}) });
+    const pub = publicUser({ ...user, lastLoginAt });
+    if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
+    const access = accessToken(session);
+    return { token: access.token, expiresAt: access.expiresAt, refreshToken: token, refreshExpiresAt: refreshExpiry(session), user: pub };
+  }
+
   async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals, tlsFingerprint?: string): Promise<{ token: string; session: Session }> {
     const token = randomToken();
     const now = Date.now();
@@ -276,7 +310,11 @@ export function createAuth(o: AuthOptions) {
         if (first) await audit({ orgId: first.orgId, userId: first.id, action: "auth.login_failed", ip: input.ip });
         throw new AuthError("INVALID_CREDENTIALS", "Email or password is incorrect");
       }
-      if (matched.length > 1) throw new AuthError("ORG_REQUIRED", "This email belongs to several organisations. Choose one.");
+      if (matched.length > 1) {
+        // the password matched every one of these accounts, so naming their organisations reveals nothing new
+        const organizations = await choicesFor(matched.filter((u) => u.status === "active"));
+        throw new AuthError("ORG_REQUIRED", "This email belongs to several organisations. Choose one.", { organizations });
+      }
       const user = matched[0]!;
       if (user.status === "disabled") throw new AuthError("ACCOUNT_DISABLED", "This account is disabled");
       if (user.status === "invited") throw new AuthError("INVITE_PENDING", "Accept your invitation first");
@@ -285,15 +323,45 @@ export function createAuth(o: AuthOptions) {
       // only failed attempts count against the IP: staff behind one office connection must all be able to
       // sign in. Every attempt is still counted first, so a burst of guesses is blocked before verification.
       if (input.ip) await limiter.undo?.(`login:ip:${input.ip}`);
-      const patch: { lastLoginAt: Date; passwordHash?: string } = { lastLoginAt: new Date() };
-      if (needsRehash(user.passwordHash)) patch.passwordHash = await hashPassword(input.password);
-      await o.users.update(user.id, patch);
-      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device, input.tlsFingerprint);
-      await audit({ orgId: user.orgId, userId: user.id, action: "auth.login", ip: input.ip });
-      const pub = publicUser({ ...user, lastLoginAt: patch.lastLoginAt });
-      if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
-      const access = accessToken(session);
-      return { token: access.token, expiresAt: access.expiresAt, refreshToken: token, refreshExpiresAt: refreshExpiry(session), user: pub };
+      if (needsRehash(user.passwordHash)) await o.users.update(user.id, { passwordHash: await hashPassword(input.password) });
+      return issue(user, input, "auth.login");
+    },
+
+    /**
+     * The organisations a signed-in person can switch to: every active account with the same email,
+     * the current one included. Needs `orgs.get` (empty otherwise).
+     */
+    async organizationsOf(userId: string): Promise<OrgChoice[]> {
+      const user = await o.users.get(userId);
+      if (!user || user.status !== "active") return [];
+      return choicesFor((await o.users.findAllByEmail(normalizeEmail(user.email))).filter((u) => u.status === "active"));
+    },
+
+    /**
+     * Moves a signed-in person to their account in another organisation (same email, active there),
+     * without the password: the current session must be valid, and it ends. The new session is bound
+     * to the same device, with the same device-binding rule as `refresh`. Audited in both organisations
+     * (auth.org_switch_out / auth.org_switch). Returns what `login` returns.
+     */
+    async switchOrganization(input: SwitchOrganizationInput): Promise<LoginResult> {
+      const viewer = await authenticate(input.token);
+      if (!viewer) throw new AuthError("UNAUTHENTICATED", "Sign in required");
+      const s = await o.sessions.get(viewer.sessionId);
+      if (!s) throw new AuthError("UNAUTHENTICATED", "Sign in required");
+      const target = input.orgId === viewer.orgId ? null : (await o.users.findAllByEmail(normalizeEmail(viewer.email))).find((u) => u.orgId === input.orgId && u.status === "active");
+      if (!target) throw new AuthError("ORG_UNAVAILABLE", "You can't switch to that organisation");
+      const device = cleanDeviceSignals(input.device);
+      const bound = s.device?.deviceId;
+      if (deviceBinding !== "off" && bound && device?.deviceId !== bound) {
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null, switchTo: target.orgId } });
+        if (deviceBinding === "enforce") {
+          await o.sessions.delete(s.id);
+          throw new AuthError("INVALID_TOKEN", "Sign in again");
+        }
+      }
+      await o.sessions.delete(s.id);
+      await audit({ orgId: viewer.orgId, userId: viewer.userId, action: "auth.org_switch_out", ip: input.ip, data: { to: target.orgId } });
+      return issue(target, { ...input, device: device ? { ...device, deviceId: bound ?? device.deviceId } : s.device }, "auth.org_switch", { from: viewer.orgId });
     },
 
     /**

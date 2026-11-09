@@ -10,7 +10,7 @@ There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jo
 | | |
 | --- | --- |
 | **Passwords** | scrypt (N=2¹⁵), salted, self-describing hashes; weaker hashes upgraded on the next login; NIST-style policy (length, common passwords, repeated characters, no email) |
-| **Login** | rate-limited per IP (failed attempts only: an office of staff on one connection can all sign in) and per email; timing-safe (an unknown email costs the same as a wrong password); same email in several organisations → `ORG_REQUIRED`; audited |
+| **Login** | rate-limited per IP (failed attempts only: an office of staff on one connection can all sign in) and per email; timing-safe (an unknown email costs the same as a wrong password); same email in several organisations → `ORG_REQUIRED` with the organisations whose account matched the password (`details.organizations`); audited |
 | **Sessions** | opaque tokens, stored only as SHA-256; idle timeout that slides with use plus an absolute maximum age; list devices, revoke one, log out everywhere |
 | **JWT mode** | short-lived HS256 access tokens plus single-use refresh tokens, rotated on every refresh; a refresh token used twice ends its session (theft); secret rotation; logout and revocation still apply at once |
 | **Accounts** | disabling a user or changing roles applies on the very next request |
@@ -122,6 +122,8 @@ networks change it. A refresh without one keeps the stored hash, and `auth.devic
 | Call | Returns / throws |
 | --- | --- |
 | `login({ email, password, orgCode?, ip?, userAgent?, device?, tlsFingerprint? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `organizationsOf(userId)` | `OrgChoice[]` (`{ orgId, code, name }`): every active account with the same email, the current one included. Needs `orgs.get` |
+| `switchOrganization({ token, orgId, ip?, userAgent?, device?, tlsFingerprint? })` | what `login` returns, for the same person's account in `orgId`; the old session ends; same device rule as `refresh`; audited in both organisations (`auth.org_switch_out`, `auth.org_switch`) · `UNAUTHENTICATED` `ORG_UNAVAILABLE` `INVALID_TOKEN` |
 | `refresh({ refreshToken, ip?, userAgent?, device?, tlsFingerprint? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
 | `verifyAccessToken(token)` | JWT mode: claims `{ sub, org, sid, iat, exp }` or null, no storage read |
 | `authenticate(token)` | `Viewer \| null` (slides the idle window) |
@@ -144,7 +146,16 @@ Also exported:
 - `can`, `branchesFor`, `permissionsOf`, `roleMap`.
 
 Every failure is an `AuthError` with a stable `code`, an HTTP-style `statusCode`, and `details.retryAfterMs`
-where it applies.
+where it applies. `ORG_REQUIRED` carries `details.organizations` (`OrgChoice[]`, only the accounts the password
+matched, and only when `orgs.get` is passed) so a client can show a pick list and log in again with `orgCode`.
+
+### Several organisations, one person
+
+The same email can have an account in several organisations (one user record each). Sign-in with that email
+and password answers `ORG_REQUIRED` with the organisations to choose from; the client logs in again with the
+chosen `orgCode`. Once signed in, `organizationsOf(userId)` lists them and `switchOrganization` moves the
+session to another one without asking for the password again: the current session must be valid and
+on the same device, it ends, and a new one starts for the other account. Pass `orgs: db.repos.orgs` (it has `get`).
 
 ## Built-in roles
 
