@@ -178,6 +178,16 @@ where it applies.
 `owner` (everything) · `admin` · `branch_manager` · `front_desk` · `phlebotomist` · `technician` ·
 `pathologist` · `accountant` (including the books: `accounts:*`) · `doctor` (referring; read only).
 
+Partner-lab imports (the api's `importExternalReport` and friends, built on report-reader):
+
+| permission | what it allows | granted by |
+| --- | --- | --- |
+| `report:import` | upload a partner lab's PDF report, match it to a booking, apply its results | `admin`, `pathologist`, `technician` (`report:*` covers it) |
+| `signatory:read` | list the partner signature registry | `admin`, `pathologist`, `technician` |
+| `signatory:manage` | name a partner doctor's signature, edit or remove one | `admin`, `pathologist` |
+
+Imported results still go through `report:verify` as usual.
+
 ## Not here (by design)
 
 - **HTTP / GraphQL endpoints.** The backend exposes `login`, `logout`, `me` and the rest as GraphQL
@@ -208,7 +218,7 @@ src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, 
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
 src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  128 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
+scripts/test.ts  131 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules
@@ -218,7 +228,8 @@ scripts/test.ts  128 checks; session, JWT, device-binding and TLS-fingerprint fl
 3. **Every request re-reads the user** (`authenticate`), so disabling and role changes apply at once. Do not cache users across requests.
 4. Interfaces stay **structural and small**. db-kit's repositories must keep satisfying them (users, orgs, roles, audit).
 5. Permissions the backend checks must exist in `PERMISSIONS` and be granted by the right `SYSTEM_ROLES`
-   (db-kit's resolvers need `accounts:read|post|manage`, among others).
+   (db-kit's resolvers need `accounts:read|post|manage`, among others; the api's partner-lab imports need
+   `report:import` and `signatory:read|manage`).
 6. **JWT mode keeps rules 1 and 3.** Access JWTs carry the session id and every request still checks the
    session and re-reads the user; refresh tokens are opaque, single-use and stored as hashes. Never accept
    `alg` from the token (HS256 only), never sign with a secret under 32 characters.
@@ -277,7 +288,7 @@ Key facts for agents:
 ```json
 {
   "name": "@mgpl-diagnostics/auth-kit",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "MGPL Diagnostics authentication for the backend: scrypt passwords, revocable sessions (Redis or memory), rate-limited timing-safe login, password reset, roles and branch-aware permissions. An internal API, no HTTP server.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -407,7 +418,7 @@ console.log(`llms-full.txt: ${ordered.length} files, ${(out.length / 1024).toFix
 import RedisMock from "ioredis-mock";
 import {
   AuthError, cleanDeviceSignals, createAuth, hashTlsFingerprint, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
-  permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, SYSTEM_ROLES,
+  permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, PERMISSIONS, SYSTEM_ROLES,
   type AuditSink, type AuthUser, type KeyValueStore, type RateLimiter, type RoleStore, type SessionStore, type UserStore,
 } from "../src/index";
 import { redisKeyValueStore, redisRateLimiter, redisSessionStore } from "../src/redis";
@@ -461,6 +472,11 @@ async function units() {
   ok(branchesFor(desk, "booking:read", rm).toString() === "b1" && branchesFor([{ role: "admin", branchId: null }], "booking:read", rm) === "all", "branchesFor: list vs all");
   ok(permissionsOf([{ role: "lab_auditor", branchId: null }], rm).join() === "audit:read", "custom organisation role");
   ok(SYSTEM_ROLES.some((r) => r.key === "accountant" && r.permissions.includes("accounts:*")), "accountant role covers the books");
+  // partner-lab imports (api: importExternalReport…, nameExternalSignature)
+  ok(["report:import", "signatory:read", "signatory:manage"].every((p) => (PERMISSIONS as readonly string[]).includes(p)), "PERMISSIONS has report:import, signatory:read, signatory:manage");
+  const at = (role: string, p: string) => can([{ role, branchId: "b1" }], p, rm, "b1");
+  ok(at("admin", "report:import") && at("pathologist", "report:import") && at("technician", "report:import") && !at("front_desk", "report:import") && !at("accountant", "report:import"), "report:import: admin, pathologist, technician; not front desk or accountant");
+  ok(at("admin", "signatory:manage") && at("pathologist", "signatory:manage") && !at("technician", "signatory:manage") && at("technician", "signatory:read") && !at("front_desk", "signatory:read"), "signatory:manage: admin, pathologist; technician reads the registry only");
 }
 
 // ------------------------------------------------------------------ flows, per store
@@ -1526,6 +1542,10 @@ export const PERMISSIONS = [
   "booking:read", "booking:create", "booking:update", "booking:cancel",
   "sample:read", "sample:collect", "sample:receive", "sample:reject",
   "report:read", "report:enter", "report:verify", "report:release", "report:amend",
+  // partner-lab PDF imports: upload, match to a booking, apply results (report-reader in the api)
+  "report:import",
+  // the partner signature registry: name a partner doctor's signature, edit or remove it
+  "signatory:read", "signatory:manage",
   "invoice:read", "invoice:create", "invoice:discount", "invoice:cancel",
   "payment:read", "payment:create", "payment:refund",
   "accounts:read", "accounts:post", "accounts:manage",
@@ -1547,7 +1567,7 @@ export const SYSTEM_ROLES: RoleDefinition[] = [
   {
     key: "admin",
     name: "Administrator",
-    permissions: ["org:read", "branch:*", "user:*", "role:*", "patient:*", "doctor:*", "booking:*", "sample:*", "report:*", "invoice:*", "payment:*", "accounts:*", "audit:read", "settings:manage"],
+    permissions: ["org:read", "branch:*", "user:*", "role:*", "patient:*", "doctor:*", "booking:*", "sample:*", "report:*", "signatory:*", "invoice:*", "payment:*", "accounts:*", "audit:read", "settings:manage"],
   },
   {
     key: "branch_manager",
@@ -1560,8 +1580,8 @@ export const SYSTEM_ROLES: RoleDefinition[] = [
     permissions: ["org:read", "branch:read", "patient:read", "patient:create", "patient:update", "doctor:read", "booking:read", "booking:create", "booking:update", "sample:read", "report:read", "invoice:read", "invoice:create", "payment:read", "payment:create"],
   },
   { key: "phlebotomist", name: "Phlebotomist", permissions: ["branch:read", "patient:read", "booking:read", "sample:read", "sample:collect"] },
-  { key: "technician", name: "Lab technician", permissions: ["branch:read", "patient:read", "booking:read", "sample:*", "report:read", "report:enter"] },
-  { key: "pathologist", name: "Pathologist", permissions: ["branch:read", "patient:read", "booking:read", "sample:read", "report:*"] },
+  { key: "technician", name: "Lab technician", permissions: ["branch:read", "patient:read", "booking:read", "sample:*", "report:read", "report:enter", "report:import", "signatory:read"] },
+  { key: "pathologist", name: "Pathologist", permissions: ["branch:read", "patient:read", "booking:read", "sample:read", "report:*", "signatory:*"] },
   { key: "accountant", name: "Accountant", permissions: ["org:read", "branch:read", "patient:read", "invoice:read", "invoice:cancel", "payment:*", "accounts:*", "audit:read"] },
   { key: "doctor", name: "Referring doctor", permissions: ["patient:read", "report:read"] },
 ];

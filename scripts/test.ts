@@ -2,7 +2,7 @@
 import RedisMock from "ioredis-mock";
 import {
   AuthError, cleanDeviceSignals, createAuth, hashTlsFingerprint, hashPassword, hashToken, memoryKeyValueStore, memoryRateLimiter, memorySessionStore, needsRehash,
-  permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, SYSTEM_ROLES,
+  permissionsOf, roleMap, verifyPassword, assertPasswordPolicy, can, branchesFor, PERMISSIONS, SYSTEM_ROLES,
   type AuditSink, type AuthUser, type KeyValueStore, type RateLimiter, type RoleStore, type SessionStore, type UserStore,
 } from "../src/index";
 import { redisKeyValueStore, redisRateLimiter, redisSessionStore } from "../src/redis";
@@ -56,6 +56,11 @@ async function units() {
   ok(branchesFor(desk, "booking:read", rm).toString() === "b1" && branchesFor([{ role: "admin", branchId: null }], "booking:read", rm) === "all", "branchesFor: list vs all");
   ok(permissionsOf([{ role: "lab_auditor", branchId: null }], rm).join() === "audit:read", "custom organisation role");
   ok(SYSTEM_ROLES.some((r) => r.key === "accountant" && r.permissions.includes("accounts:*")), "accountant role covers the books");
+  // partner-lab imports (api: importExternalReport…, nameExternalSignature)
+  ok(["report:import", "signatory:read", "signatory:manage"].every((p) => (PERMISSIONS as readonly string[]).includes(p)), "PERMISSIONS has report:import, signatory:read, signatory:manage");
+  const at = (role: string, p: string) => can([{ role, branchId: "b1" }], p, rm, "b1");
+  ok(at("admin", "report:import") && at("pathologist", "report:import") && at("technician", "report:import") && !at("front_desk", "report:import") && !at("accountant", "report:import"), "report:import: admin, pathologist, technician; not front desk or accountant");
+  ok(at("admin", "signatory:manage") && at("pathologist", "signatory:manage") && !at("technician", "signatory:manage") && at("technician", "signatory:read") && !at("front_desk", "signatory:read"), "signatory:manage: admin, pathologist; technician reads the registry only");
 }
 
 // ------------------------------------------------------------------ flows, per store

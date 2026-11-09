@@ -151,6 +151,16 @@ where it applies.
 `owner` (everything) · `admin` · `branch_manager` · `front_desk` · `phlebotomist` · `technician` ·
 `pathologist` · `accountant` (including the books: `accounts:*`) · `doctor` (referring; read only).
 
+Partner-lab imports (the api's `importExternalReport` and friends, built on report-reader):
+
+| permission | what it allows | granted by |
+| --- | --- | --- |
+| `report:import` | upload a partner lab's PDF report, match it to a booking, apply its results | `admin`, `pathologist`, `technician` (`report:*` covers it) |
+| `signatory:read` | list the partner signature registry | `admin`, `pathologist`, `technician` |
+| `signatory:manage` | name a partner doctor's signature, edit or remove one | `admin`, `pathologist` |
+
+Imported results still go through `report:verify` as usual.
+
 ## Not here (by design)
 
 - **HTTP / GraphQL endpoints.** The backend exposes `login`, `logout`, `me` and the rest as GraphQL
