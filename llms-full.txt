@@ -37,7 +37,7 @@ There is no HTTP server here. Your backend (GraphQL resolvers, REST handlers, jo
 | | |
 | --- | --- |
 | **Passwords** | scrypt (N=2¹⁵), salted, self-describing hashes; weaker hashes upgraded on the next login; NIST-style policy (length, common passwords, repeated characters, no email) |
-| **Login** | rate-limited per IP (failed attempts only: an office of staff on one connection can all sign in) and per email; timing-safe (an unknown email costs the same as a wrong password); same email in several organisations → `ORG_REQUIRED`; audited |
+| **Login** | rate-limited per IP (failed attempts only: an office of staff on one connection can all sign in) and per email; timing-safe (an unknown email costs the same as a wrong password); same email in several organisations → `ORG_REQUIRED` with the organisations whose account matched the password (`details.organizations`); audited |
 | **Sessions** | opaque tokens, stored only as SHA-256; idle timeout that slides with use plus an absolute maximum age; list devices, revoke one, log out everywhere |
 | **JWT mode** | short-lived HS256 access tokens plus single-use refresh tokens, rotated on every refresh; a refresh token used twice ends its session (theft); secret rotation; logout and revocation still apply at once |
 | **Accounts** | disabling a user or changing roles applies on the very next request |
@@ -149,6 +149,8 @@ networks change it. A refresh without one keeps the stored hash, and `auth.devic
 | Call | Returns / throws |
 | --- | --- |
 | `login({ email, password, orgCode?, ip?, userAgent?, device?, tlsFingerprint? })` | `{ token, expiresAt, user }`, plus `refreshToken, refreshExpiresAt` in JWT mode (`token` is then the access JWT) · `INVALID_CREDENTIALS` `ACCOUNT_DISABLED` `INVITE_PENDING` `ORG_REQUIRED` `RATE_LIMITED` |
+| `organizationsOf(userId)` | `OrgChoice[]` (`{ orgId, code, name }`): every active account with the same email, the current one included. Needs `orgs.get` |
+| `switchOrganization({ token, orgId, ip?, userAgent?, device?, tlsFingerprint? })` | what `login` returns, for the same person's account in `orgId`; the old session ends; same device rule as `refresh`; audited in both organisations (`auth.org_switch_out`, `auth.org_switch`) · `UNAUTHENTICATED` `ORG_UNAVAILABLE` `INVALID_TOKEN` |
 | `refresh({ refreshToken, ip?, userAgent?, device?, tlsFingerprint? })` | JWT mode: `{ accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, user }` · `INVALID_TOKEN` (also: another device) |
 | `verifyAccessToken(token)` | JWT mode: claims `{ sub, org, sid, iat, exp }` or null, no storage read |
 | `authenticate(token)` | `Viewer \| null` (slides the idle window) |
@@ -171,7 +173,16 @@ Also exported:
 - `can`, `branchesFor`, `permissionsOf`, `roleMap`.
 
 Every failure is an `AuthError` with a stable `code`, an HTTP-style `statusCode`, and `details.retryAfterMs`
-where it applies.
+where it applies. `ORG_REQUIRED` carries `details.organizations` (`OrgChoice[]`, only the accounts the password
+matched, and only when `orgs.get` is passed) so a client can show a pick list and log in again with `orgCode`.
+
+### Several organisations, one person
+
+The same email can have an account in several organisations (one user record each). Sign-in with that email
+and password answers `ORG_REQUIRED` with the organisations to choose from; the client logs in again with the
+chosen `orgCode`. Once signed in, `organizationsOf(userId)` lists them and `switchOrganization` moves the
+session to another one without asking for the password again: the current session must be valid and
+on the same device, it ends, and a new one starts for the other account. Pass `orgs: db.repos.orgs` (it has `get`).
 
 ## Built-in roles
 
@@ -217,8 +228,9 @@ src/rbac.ts      PERMISSIONS, SYSTEM_ROLES, can, branchesFor, permissionsOf, rol
 src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, SessionStore, KeyValueStore, RateLimiter)
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
-src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  131 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
+src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset,
+                 organizationsOf / switchOrganization (one person, several organisations)
+scripts/test.ts  155 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules
@@ -288,7 +300,7 @@ Key facts for agents:
 ```json
 {
   "name": "@mgpl-diagnostics/auth-kit",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "MGPL Diagnostics authentication for the backend: scrypt passwords, revocable sessions (Redis or memory), rate-limited timing-safe login, password reset, roles and branch-aware permissions. An internal API, no HTTP server.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -435,7 +447,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function fakeDb() {
   const users = new Map<string, AuthUser>();
-  const orgs = [{ id: "org-a", code: "MGPL" }, { id: "org-b", code: "OTHER" }];
+  const orgs = [{ id: "org-a", code: "MGPL", name: "Maa Gayatri Path Lab" }, { id: "org-b", code: "OTHER", name: "Arang Collection Centre" }, { id: "org-c", code: "THIRD", name: "Third Lab" }];
   const orgRoles: Record<string, { key: string; permissions: string[] }[]> = { "org-a": [{ key: "lab_auditor", permissions: ["audit:read", "accounts:read"] }] };
   const auditLog: { action: string; userId?: string | null; data?: Record<string, unknown> }[] = [];
   const userStore: UserStore = {
@@ -449,7 +461,7 @@ function fakeDb() {
   const add = async (u: Omit<AuthUser, "passwordHash"> & { password: string; hashParams?: { N: number; r: number; p: number } }) => {
     users.set(u.id, { ...u, passwordHash: await hashPassword(u.password, u.hashParams) });
   };
-  return { users, userStore, orgStore: { findOne: async ({ code }: { code: string }) => orgs.find((o) => o.code === code) ?? null }, roleStore, audit, auditLog, orgRoles, add };
+  return { users, userStore, orgStore: { findOne: async ({ code }: { code: string }) => orgs.find((o) => o.code === code) ?? null, get: async (id: string) => orgs.find((o) => o.id === id) ?? null }, roleStore, audit, auditLog, orgRoles, add };
 }
 
 // ------------------------------------------------------------------ unit: passwords & RBAC
@@ -508,6 +520,26 @@ async function flows(label: string, stores: { sessions: SessionStore; kv: KeyVal
   ok((await code(auth.login({ email: "gone@mgpl.in", password: "mango-season-27" }))) === "ACCOUNT_DISABLED", "disabled account → ACCOUNT_DISABLED");
   ok((await code(auth.login({ email: "dual@x.in", password: "shared-pass-99" }))) === "ORG_REQUIRED", "same email in two organisations → ORG_REQUIRED");
   ok((await auth.login({ email: "dual@x.in", password: "shared-pass-99", orgCode: "other" })).user.id === "u5", "…with orgCode → the right one");
+
+  // choosing and switching organisations
+  await db.add({ id: "u6", orgId: "org-c", name: "Dual C", email: "dual@x.in", password: "different-pass-77", status: "active", roles: [] });
+  const orgErr = await auth.login({ email: "dual@x.in", password: "shared-pass-99" }).catch((e: AuthError) => e);
+  ok(orgErr instanceof AuthError && orgErr.details.organizations?.map((x) => x.code).join() === "OTHER,MGPL" && orgErr.details.organizations[0]!.name === "Arang Collection Centre", "ORG_REQUIRED names the organisations whose password matched (sorted by name), not the others");
+  const wrongErr = await auth.login({ email: "dual@x.in", password: "wrong-password-1" }).catch((e: AuthError) => e);
+  ok(wrongErr instanceof AuthError && wrongErr.code === "INVALID_CREDENTIALS" && !wrongErr.details.organizations, "a wrong password names no organisation");
+  const inA = await auth.login({ email: "dual@x.in", password: "shared-pass-99", orgCode: "MGPL", ip: "2.2.2.2" });
+  ok((await auth.organizationsOf("u4")).map((x) => x.code).join() === "OTHER,MGPL,THIRD" && (await auth.organizationsOf("u1")).length === 1, "organizationsOf: every active account with the same email, the current one included");
+  const toB = await auth.switchOrganization({ token: inA.token, orgId: "org-b", ip: "2.2.2.2" });
+  ok(toB.user.id === "u5" && (await auth.authenticate(toB.token))?.orgId === "org-b" && (await auth.authenticate(inA.token)) === null, "switchOrganization: new session in the other organisation, the old one ends");
+  ok(db.auditLog.some((x) => x.action === "auth.org_switch_out" && x.userId === "u4" && x.data?.to === "org-b") && db.auditLog.some((x) => x.action === "auth.org_switch" && x.userId === "u5" && x.data?.from === "org-a"), "switch audited in both organisations");
+  ok((await code(auth.switchOrganization({ token: toB.token, orgId: "org-b" }))) === "ORG_UNAVAILABLE" && (await code(auth.switchOrganization({ token: toB.token, orgId: "org-x" }))) === "ORG_UNAVAILABLE", "switching to the same or an unknown organisation → ORG_UNAVAILABLE");
+  ok((await code(auth.switchOrganization({ token: login.token.replace(/.$/, "x"), orgId: "org-b" }))) === "UNAUTHENTICATED", "switching needs a valid session");
+  const asha = await auth.login({ email: "asha@mgpl.in", password: "tulsi-leaf-raipur" });
+  ok((await code(auth.switchOrganization({ token: asha.token, orgId: "org-b" }))) === "ORG_UNAVAILABLE", "no account with that email there → ORG_UNAVAILABLE");
+  await auth.logout(asha.token);
+  db.users.set("u4", { ...db.users.get("u4")!, status: "disabled" });
+  ok((await code(auth.switchOrganization({ token: toB.token, orgId: "org-a" }))) === "ORG_UNAVAILABLE" && !(await auth.organizationsOf("u5")).some((x) => x.orgId === "org-a"), "a disabled account there cannot be switched to or listed");
+  db.users.set("u4", { ...db.users.get("u4")!, status: "active" });
 
   const before = db.users.get("u2")!.passwordHash;
   await auth.login({ email: "old@mgpl.in", password: "neem-tree-arang" });
@@ -681,6 +713,20 @@ async function jwtFlows(label: string, stores: { sessions: SessionStore; kv: Key
   issued.push(u2.refreshToken);
   ok((await auth.sessionsOf("j1")).find((x) => x.id === sidOf(u2.accessToken))?.tlsFingerprintHash === hashTlsFingerprint(JA4), "a session without one is bound by the first refresh that has one");
   ok((await code(auth.refresh({ refreshToken: t4.refreshToken, device: { deviceId: "dev-laptop-9999-zzzzzz" }, tlsFingerprint: JA4b }))) === "INVALID_TOKEN" && db.auditLog.some((x) => x.action === "auth.device_mismatch" && x.data?.tls === "same"), "a device mismatch audit says whether the TLS fingerprint matched");
+  // switching organisations in JWT mode keeps the device binding
+  await db.add({ id: "j8", orgId: "org-a", name: "Two A", email: "two@x.in", password: "shared-pass-99", status: "active", roles: [] });
+  await db.add({ id: "j9", orgId: "org-b", name: "Two B", email: "two@x.in", password: "shared-pass-99", status: "active", roles: [] });
+  const sw = createAuth({ users: db.userStore, orgs: db.orgStore, audit: db.audit, ...stores, jwt: { secret: SECRET } });
+  const dev = { deviceId: "dev-switch-0001-abcdef" };
+  const s1 = await sw.login({ email: "two@x.in", password: "shared-pass-99", orgCode: "MGPL", device: dev });
+  ok((await code(sw.switchOrganization({ token: s1.token, orgId: "org-b", device: { deviceId: "dev-other-0002-zzzzzz" } }))) === "INVALID_TOKEN" && (await sw.authenticate(s1.token)) === null, "switch from another device: refused, session ended");
+  const s2 = await sw.login({ email: "two@x.in", password: "shared-pass-99", orgCode: "MGPL", device: dev });
+  const s3 = await sw.switchOrganization({ token: s2.token, orgId: "org-b", device: dev });
+  ok(!!s3.refreshToken && (await sw.authenticate(s3.token))?.userId === "j9" && (await code(sw.refresh({ refreshToken: s2.refreshToken!, device: dev }))) === "INVALID_TOKEN", "switch in JWT mode: new access + refresh token; the old refresh token is dead");
+  const s4 = await sw.refresh({ refreshToken: s3.refreshToken!, device: dev });
+  ok(s4.user.id === "j9", "the switched session refreshes on the same device");
+  issued.push(s3.refreshToken!, s4.refreshToken);
+
   ok(hashTlsFingerprint("has space x") === undefined && hashTlsFingerprint("short") === undefined && hashTlsFingerprint("x".repeat(257)) === undefined, "malformed TLS fingerprints are dropped");
 
   let threw = false;
@@ -719,7 +765,7 @@ import { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./j
 import { memoryRateLimiter } from "./memory";
 import { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, verifyPassword, type PasswordPolicy } from "./password";
 import { branchesFor, can, permissionsOf, roleMap, type Permission, type RoleAssignment, type RoleMap } from "./rbac";
-import type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
+import type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgChoice, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStore } from "./stores";
 
 export interface AuthOptions {
   users: UserStore;
@@ -819,6 +865,17 @@ export interface LoginResult {
   refreshExpiresAt?: Date;
 }
 
+/** Moving a signed-in person to their account in another organisation (same email). */
+export interface SwitchOrganizationInput {
+  /** The current access token (JWT mode) or session token. Its session ends when the switch succeeds. */
+  token: string;
+  orgId: string;
+  ip?: string;
+  userAgent?: string;
+  device?: DeviceSignals;
+  tlsFingerprint?: string;
+}
+
 /** What `refresh` returns: a new access token and the next refresh token (the old one is spent). */
 export interface TokenPair {
   accessToken: string;
@@ -908,6 +965,29 @@ export function createAuth(o: AuthOptions) {
     return user ? [user] : [];
   }
 
+  /** The organisations of these accounts, named, sorted by name. Empty without `orgs.get`. */
+  async function choicesFor(users: AuthUser[]): Promise<OrgChoice[]> {
+    if (!o.orgs?.get) return [];
+    const out: OrgChoice[] = [];
+    for (const u of users) {
+      const org = await o.orgs.get(u.orgId);
+      if (org) out.push({ orgId: org.id, code: org.code, name: org.name || org.code });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Signs a user in on a new session: last login, audit, and the token(s) for the client. */
+  async function issue(user: AuthUser, s: { ip?: string; userAgent?: string; device?: DeviceSignals; tlsFingerprint?: string }, action: string, data?: Record<string, unknown>): Promise<LoginResult> {
+    const lastLoginAt = new Date();
+    await o.users.update(user.id, { lastLoginAt });
+    const { token, session } = await startSession(user, s.ip, s.userAgent, s.device, s.tlsFingerprint);
+    await audit({ orgId: user.orgId, userId: user.id, action, ip: s.ip, ...(data ? { data } : {}) });
+    const pub = publicUser({ ...user, lastLoginAt });
+    if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
+    const access = accessToken(session);
+    return { token: access.token, expiresAt: access.expiresAt, refreshToken: token, refreshExpiresAt: refreshExpiry(session), user: pub };
+  }
+
   async function startSession(user: AuthUser, ip?: string, userAgent?: string, device?: DeviceSignals, tlsFingerprint?: string): Promise<{ token: string; session: Session }> {
     const token = randomToken();
     const now = Date.now();
@@ -992,7 +1072,11 @@ export function createAuth(o: AuthOptions) {
         if (first) await audit({ orgId: first.orgId, userId: first.id, action: "auth.login_failed", ip: input.ip });
         throw new AuthError("INVALID_CREDENTIALS", "Email or password is incorrect");
       }
-      if (matched.length > 1) throw new AuthError("ORG_REQUIRED", "This email belongs to several organisations. Choose one.");
+      if (matched.length > 1) {
+        // the password matched every one of these accounts, so naming their organisations reveals nothing new
+        const organizations = await choicesFor(matched.filter((u) => u.status === "active"));
+        throw new AuthError("ORG_REQUIRED", "This email belongs to several organisations. Choose one.", { organizations });
+      }
       const user = matched[0]!;
       if (user.status === "disabled") throw new AuthError("ACCOUNT_DISABLED", "This account is disabled");
       if (user.status === "invited") throw new AuthError("INVITE_PENDING", "Accept your invitation first");
@@ -1001,15 +1085,45 @@ export function createAuth(o: AuthOptions) {
       // only failed attempts count against the IP: staff behind one office connection must all be able to
       // sign in. Every attempt is still counted first, so a burst of guesses is blocked before verification.
       if (input.ip) await limiter.undo?.(`login:ip:${input.ip}`);
-      const patch: { lastLoginAt: Date; passwordHash?: string } = { lastLoginAt: new Date() };
-      if (needsRehash(user.passwordHash)) patch.passwordHash = await hashPassword(input.password);
-      await o.users.update(user.id, patch);
-      const { token, session } = await startSession(user, input.ip, input.userAgent, input.device, input.tlsFingerprint);
-      await audit({ orgId: user.orgId, userId: user.id, action: "auth.login", ip: input.ip });
-      const pub = publicUser({ ...user, lastLoginAt: patch.lastLoginAt });
-      if (!jwt) return { token, expiresAt: new Date(session.expiresAt), user: pub };
-      const access = accessToken(session);
-      return { token: access.token, expiresAt: access.expiresAt, refreshToken: token, refreshExpiresAt: refreshExpiry(session), user: pub };
+      if (needsRehash(user.passwordHash)) await o.users.update(user.id, { passwordHash: await hashPassword(input.password) });
+      return issue(user, input, "auth.login");
+    },
+
+    /**
+     * The organisations a signed-in person can switch to: every active account with the same email,
+     * the current one included. Needs `orgs.get` (empty otherwise).
+     */
+    async organizationsOf(userId: string): Promise<OrgChoice[]> {
+      const user = await o.users.get(userId);
+      if (!user || user.status !== "active") return [];
+      return choicesFor((await o.users.findAllByEmail(normalizeEmail(user.email))).filter((u) => u.status === "active"));
+    },
+
+    /**
+     * Moves a signed-in person to their account in another organisation (same email, active there),
+     * without the password: the current session must be valid, and it ends. The new session is bound
+     * to the same device, with the same device-binding rule as `refresh`. Audited in both organisations
+     * (auth.org_switch_out / auth.org_switch). Returns what `login` returns.
+     */
+    async switchOrganization(input: SwitchOrganizationInput): Promise<LoginResult> {
+      const viewer = await authenticate(input.token);
+      if (!viewer) throw new AuthError("UNAUTHENTICATED", "Sign in required");
+      const s = await o.sessions.get(viewer.sessionId);
+      if (!s) throw new AuthError("UNAUTHENTICATED", "Sign in required");
+      const target = input.orgId === viewer.orgId ? null : (await o.users.findAllByEmail(normalizeEmail(viewer.email))).find((u) => u.orgId === input.orgId && u.status === "active");
+      if (!target) throw new AuthError("ORG_UNAVAILABLE", "You can't switch to that organisation");
+      const device = cleanDeviceSignals(input.device);
+      const bound = s.device?.deviceId;
+      if (deviceBinding !== "off" && bound && device?.deviceId !== bound) {
+        await audit({ orgId: s.orgId, userId: s.userId, action: "auth.device_mismatch", ip: input.ip, entity: "session", data: { expected: bound, got: device?.deviceId ?? null, switchTo: target.orgId } });
+        if (deviceBinding === "enforce") {
+          await o.sessions.delete(s.id);
+          throw new AuthError("INVALID_TOKEN", "Sign in again");
+        }
+      }
+      await o.sessions.delete(s.id);
+      await audit({ orgId: viewer.orgId, userId: viewer.userId, action: "auth.org_switch_out", ip: input.ip, data: { to: target.orgId } });
+      return issue(target, { ...input, device: device ? { ...device, deviceId: bound ?? device.deviceId } : s.device }, "auth.org_switch", { from: viewer.orgId });
     },
 
     /**
@@ -1207,6 +1321,8 @@ export function createAuth(o: AuthOptions) {
 ## File: src/errors.ts
 
 ```ts
+import type { OrgChoice } from "./stores";
+
 export type AuthErrorCode =
   | "INVALID_CREDENTIALS"
   | "ACCOUNT_DISABLED"
@@ -1216,7 +1332,8 @@ export type AuthErrorCode =
   | "WEAK_PASSWORD"
   | "INVALID_TOKEN"
   | "UNAUTHENTICATED"
-  | "FORBIDDEN";
+  | "FORBIDDEN"
+  | "ORG_UNAVAILABLE";
 
 const STATUS: Record<AuthErrorCode, number> = {
   INVALID_CREDENTIALS: 401,
@@ -1228,6 +1345,7 @@ const STATUS: Record<AuthErrorCode, number> = {
   INVALID_TOKEN: 400,
   UNAUTHENTICATED: 401,
   FORBIDDEN: 403,
+  ORG_UNAVAILABLE: 403,
 };
 
 /** Every auth failure. `code` is stable for clients; `statusCode` suits HTTP and GraphQL extensions. */
@@ -1236,7 +1354,12 @@ export class AuthError extends Error {
   constructor(
     readonly code: AuthErrorCode,
     message: string,
-    readonly details: { retryAfterMs?: number; permission?: string } = {},
+    readonly details: {
+      retryAfterMs?: number;
+      permission?: string;
+      /** ORG_REQUIRED: the organisations whose account matched the email and password. Only after the password was verified. */
+      organizations?: OrgChoice[];
+    } = {},
   ) {
     super(message);
     this.name = "AuthError";
@@ -1251,7 +1374,7 @@ export class AuthError extends Error {
 ## File: src/index.ts
 
 ```ts
-export { cleanDeviceSignals, createAuth, hashTlsFingerprint, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type TokenPair, type Viewer } from "./auth";
+export { cleanDeviceSignals, createAuth, hashTlsFingerprint, type Auth, type AuthContext, type AuthOptions, type LoginInput, type LoginResult, type PublicUser, type SwitchOrganizationInput, type TokenPair, type Viewer } from "./auth";
 export { jwtSigner, looksLikeJwt, type AccessClaims, type JwtOptions } from "./jwt";
 export { AuthError, type AuthErrorCode } from "./errors";
 export { assertPasswordPolicy, hashPassword, hashToken, needsRehash, randomToken, SCRYPT, verifyPassword, type PasswordPolicy } from "./password";
@@ -1260,7 +1383,7 @@ export {
   type Permission, type RoleAssignment, type RoleDefinition, type RoleMap,
 } from "./rbac";
 export { memoryKeyValueStore, memoryRateLimiter, memorySessionStore } from "./memory";
-export type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStatus, UserStore } from "./stores";
+export type { AuditSink, AuthUser, DeviceSignals, KeyValueStore, OrgChoice, OrgStore, RateLimiter, RoleStore, Session, SessionStore, UserStatus, UserStore } from "./stores";
 ```
 
 
@@ -1782,6 +1905,15 @@ export interface UserStore {
 
 export interface OrgStore {
   findOne(filter: { code: string }): Promise<{ id: string; code: string } | null>;
+  /** By id. Needed to name the organisations a person can choose (ORG_REQUIRED, organizationsOf). */
+  get?(id: string): Promise<{ id: string; code: string; name?: string } | null>;
+}
+
+/** One organisation a person can sign in to (same email, an active account there). */
+export interface OrgChoice {
+  orgId: string;
+  code: string;
+  name: string;
 }
 
 export interface RoleStore {

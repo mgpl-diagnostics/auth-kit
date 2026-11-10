@@ -29,6 +29,15 @@ export interface UserStore {
 
 export interface OrgStore {
   findOne(filter: { code: string }): Promise<{ id: string; code: string } | null>;
+  /** By id. Needed to name the organisations a person can choose (ORG_REQUIRED, organizationsOf). */
+  get?(id: string): Promise<{ id: string; code: string; name?: string } | null>;
+}
+
+/** One organisation a person can sign in to (same email, an active account there). */
+export interface OrgChoice {
+  orgId: string;
+  code: string;
+  name: string;
 }
 
 export interface RoleStore {

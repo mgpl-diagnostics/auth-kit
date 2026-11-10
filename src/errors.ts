@@ -1,3 +1,5 @@
+import type { OrgChoice } from "./stores";
+
 export type AuthErrorCode =
   | "INVALID_CREDENTIALS"
   | "ACCOUNT_DISABLED"
@@ -7,7 +9,8 @@ export type AuthErrorCode =
   | "WEAK_PASSWORD"
   | "INVALID_TOKEN"
   | "UNAUTHENTICATED"
-  | "FORBIDDEN";
+  | "FORBIDDEN"
+  | "ORG_UNAVAILABLE";
 
 const STATUS: Record<AuthErrorCode, number> = {
   INVALID_CREDENTIALS: 401,
@@ -19,6 +22,7 @@ const STATUS: Record<AuthErrorCode, number> = {
   INVALID_TOKEN: 400,
   UNAUTHENTICATED: 401,
   FORBIDDEN: 403,
+  ORG_UNAVAILABLE: 403,
 };
 
 /** Every auth failure. `code` is stable for clients; `statusCode` suits HTTP and GraphQL extensions. */
@@ -27,7 +31,12 @@ export class AuthError extends Error {
   constructor(
     readonly code: AuthErrorCode,
     message: string,
-    readonly details: { retryAfterMs?: number; permission?: string } = {},
+    readonly details: {
+      retryAfterMs?: number;
+      permission?: string;
+      /** ORG_REQUIRED: the organisations whose account matched the email and password. Only after the password was verified. */
+      organizations?: OrgChoice[];
+    } = {},
   ) {
     super(message);
     this.name = "AuthError";

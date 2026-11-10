@@ -12,8 +12,9 @@ src/rbac.ts      PERMISSIONS, SYSTEM_ROLES, can, branchesFor, permissionsOf, rol
 src/stores.ts    storage interfaces (UserStore, OrgStore, RoleStore, AuditSink, SessionStore, KeyValueStore, RateLimiter)
 src/memory.ts    in-process stores (tests, single server)
 src/redis.ts     Redis stores ("/redis" entry): sessions, single-use values, sliding-window limiter
-src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset
-scripts/test.ts  131 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
+src/auth.ts      createAuth(): login, refresh (JWT mode), authenticate, context, require, logout, sessions, password change/reset,
+                 organizationsOf / switchOrganization (one person, several organisations)
+scripts/test.ts  155 checks; session, JWT, device-binding and TLS-fingerprint flows run on both memory and Redis (ioredis-mock) stores
 ```
 
 ## Rules
