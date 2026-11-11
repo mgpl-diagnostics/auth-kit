@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The job id "ci" is the required status check on main (see mgpl-diagnostics/.github scripts/protect-repos.mjs).
@@ -19,10 +19,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-      - run: npm install --no-package-lock
+      - uses: mgpl-diagnostics/.github/actions/node@claude/project-thread-dsh6g4
       - run: npm run typecheck
       - name: Tests (data integrity, lookups, ranges, search quality and speed)
         run: npm test
